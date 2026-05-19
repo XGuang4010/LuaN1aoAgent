@@ -23,6 +23,7 @@ import subprocess
 import time
 import logging
 import shlex
+import shutil
 from typing import Dict, Any, List
 from http.server import BaseHTTPRequestHandler
 import sys
@@ -883,6 +884,128 @@ async def sqlmap_tool(
         logger.exception("sqlmap execution failed")
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
 
+
+def _resolve_dirsearch_executable() -> str:
+    """解析可用的 dirsearch 可执行文件。"""
+
+    candidates = ["dirsearch", "dirsearch.py"]
+    for candidate in candidates:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return "dirsearch"
+
+
+def _split_dirsearch_args(extra_args: str) -> List[str]:
+    """按当前平台语义拆分 dirsearch 参数，避免 Windows 反斜杠被吞掉。"""
+
+    if not extra_args:
+        return []
+    return shlex.split(extra_args, posix=os.name != "nt")
+
+
+def _normalize_dirsearch_args(extra_args: str) -> tuple[List[str], List[str]]:
+    """规范化额外参数，并返回归一化参数与警告列表。"""
+
+    incompatible_args = {
+        "--recursive-level": "-r",
+        "--recursion-level": "-r",
+    }
+    normalized_args: List[str] = []
+    warnings_list: List[str] = []
+
+    args_list = _split_dirsearch_args(extra_args)
+    i = 0
+    while i < len(args_list):
+        arg = args_list[i]
+
+        replaced = False
+        for bad_arg, replacement in incompatible_args.items():
+            if arg == bad_arg or arg.startswith(f"{bad_arg}="):
+                warnings_list.append(
+                    f"Filtered incompatible dirsearch argument '{arg}', replaced with '{replacement}'."
+                )
+                normalized_args.append(replacement)
+                if "=" not in arg and i + 1 < len(args_list) and not args_list[i + 1].startswith("-"):
+                    i += 1
+                replaced = True
+                break
+        if replaced:
+            i += 1
+            continue
+
+        if arg in {"-w", "--wordlists"}:
+            if i + 1 < len(args_list):
+                wordlist_path = args_list[i + 1]
+                if (
+                    os.path.isabs(wordlist_path) or wordlist_path.startswith("/")
+                ) and not os.path.exists(wordlist_path):
+                    warnings_list.append(
+                        f"Skipped missing dirsearch wordlist: {wordlist_path}"
+                    )
+                    i += 2
+                    continue
+                normalized_args.extend([arg, wordlist_path])
+                i += 2
+                continue
+            normalized_args.append(arg)
+            i += 1
+            continue
+
+        if arg.startswith("--wordlists="):
+            _, wordlist_path = arg.split("=", 1)
+            if (
+                os.path.isabs(wordlist_path) or wordlist_path.startswith("/")
+            ) and not os.path.exists(wordlist_path):
+                warnings_list.append(
+                    f"Skipped missing dirsearch wordlist: {wordlist_path}"
+                )
+                i += 1
+                continue
+
+        normalized_args.append(arg)
+        i += 1
+
+    return normalized_args, warnings_list
+
+
+def _classify_dirsearch_failure(output: str, return_code: int) -> Dict[str, Any]:
+    """基于输出内容对 dirsearch 失败进行分类。"""
+
+    lowered_output = output.lower()
+    error_type = "RUNTIME"
+    fix_suggestion = "Check dirsearch availability, arguments, and target accessibility."
+
+    if "pkg_resources" in lowered_output:
+        error_type = "MISSING_RUNTIME_DEPENDENCY"
+        fix_suggestion = "Install setuptools for the dirsearch runtime environment."
+    elif "wordlist" in lowered_output and (
+        "does not exist" in lowered_output
+        or "no such file or directory" in lowered_output
+        or "not found" in lowered_output
+    ):
+        error_type = "MISSING_WORDLIST"
+        fix_suggestion = "Provide an existing dirsearch wordlist path or remove the custom wordlist argument."
+    elif (
+        "is not recognized as an internal or external command" in lowered_output
+        or "no such file or directory" in lowered_output
+        or "not found" in lowered_output
+    ):
+        error_type = "MISSING_TOOL"
+        fix_suggestion = "Install dirsearch or ensure it is available in PATH."
+    elif "no such option" in lowered_output or "unrecognized arguments" in lowered_output:
+        error_type = "INVALID_ARGS"
+        fix_suggestion = "Some arguments are not supported by the installed dirsearch version."
+
+    return {
+        "success": False,
+        "output": output,
+        "error_type": error_type,
+        "message": f"Command returned non-zero exit status {return_code}.",
+        "fix_suggestion": fix_suggestion,
+    }
+
+
 @mcp.tool()
 async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_args: str = "") -> str:
     """
@@ -892,43 +1015,14 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
     :param extra_args: 其他Dirsearch参数
     :return: 扫描结果
     """
-    # 过滤已知不兼容的参数（不同版本的 dirsearch 参数不同）
-    INCOMPATIBLE_ARGS = {
-        "--recursive-level": "-r",  # 旧版本使用 --recursive-level N，新版本使用 -r 或 --max-recursion-depth
-        "--recursion-level": "-r",
-    }
-    
-    # 处理 extra_args，移除不兼容参数并记录警告
-    filtered_args = []
-    if extra_args:
-        args_list = extra_args.split()
-        i = 0
-        while i < len(args_list):
-            arg = args_list[i]
-            # 检查是否是不兼容参数
-            incompatible = False
-            for bad_arg, replacement in INCOMPATIBLE_ARGS.items():
-                if arg.startswith(bad_arg):
-                    logger.warning(f"[dirsearch_scan] 过滤不兼容参数 '{arg}'，使用 '{replacement}' 替代")
-                    # 如果参数带值（如 --recursive-level 2），跳过值
-                    if "=" not in arg and i + 1 < len(args_list) and not args_list[i + 1].startswith("-"):
-                        i += 1  # 跳过参数值
-                    filtered_args.append(replacement)
-                    incompatible = True
-                    break
-            if not incompatible:
-                filtered_args.append(arg)
-            i += 1
-    
-    cmd = f"dirsearch -u {url} -e {extensions} -q"
-    if filtered_args:
-        cmd += " " + " ".join(filtered_args)
-
+    executable = _resolve_dirsearch_executable()
+    normalized_args, warnings_list = _normalize_dirsearch_args(extra_args)
+    cmd = [executable, "-u", url, "-e", extensions, "-q", *normalized_args]
     output_lines = []
     try:
-        process = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE, 
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT
         )
 
@@ -942,29 +1036,17 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
         return_code = await process.wait()
         full_output = "".join(output_lines)
 
-        # 检测参数错误并提供更友好的错误信息
         if return_code != 0:
-            error_type = "RUNTIME"
-            fix_suggestion = "Check the command's arguments and permissions."
-            
-            if "no such option" in full_output.lower() or "unrecognized arguments" in full_output.lower():
-                error_type = "INVALID_ARGS"
-                fix_suggestion = "Some arguments are not supported by the installed dirsearch version. Try without extra_args."
-            elif "not found" in full_output.lower():
-                error_type = "MISSING_TOOL"
-                fix_suggestion = "Install dirsearch or use alternative directory scanning methods."
-            
-            return json.dumps(
-                {
-                    "success": False,
-                    "output": full_output,
-                    "error_type": error_type,
-                    "message": f"Command returned non-zero exit status {return_code}.",
-                    "fix_suggestion": fix_suggestion,
-                }
-            )
+            failure = _classify_dirsearch_failure(full_output, return_code)
+            failure["warnings"] = warnings_list
+            return json.dumps(failure, ensure_ascii=False)
 
-        return json.dumps({"success": True, "output": full_output, "error": ""})
+        return json.dumps({"success": True, "output": full_output, "error": "", "warnings": warnings_list})
+
+    except FileNotFoundError:
+        failure = _classify_dirsearch_failure(f"{executable} not found", return_code=127)
+        failure["warnings"] = warnings_list
+        return json.dumps(failure, ensure_ascii=False)
 
     except Exception as e:
         logger.exception("dirsearch_scan执行失败")
@@ -975,6 +1057,7 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
                 "error_type": "RUNTIME",
                 "message": f"Dirsearch execution failed: {str(e)}",
                 "fix_suggestion": "Check tool availability, arguments, and target accessibility.",
+                "warnings": warnings_list,
             }
         )
 

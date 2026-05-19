@@ -11,6 +11,7 @@
 import json
 import asyncio
 import os
+from pathlib import Path
 from typing import Any, Dict, Optional, List
 
 # 兼容环境：如果未安装 mcp 库，降级为占位实现并返回友好错误
@@ -150,6 +151,13 @@ class PersistentSession:
 # 全局原生异步会话存储
 _async_sessions: Dict[str, PersistentSession] = {}
 _sessions_initialized = False
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _get_mcp_config_path() -> str:
+    """返回项目根目录下的 mcp.json 路径。"""
+
+    return str(PROJECT_ROOT / "mcp.json")
 
 
 async def initialize_sessions():
@@ -159,8 +167,9 @@ async def initialize_sessions():
         return
 
     config = {}
-    if os.path.exists("mcp.json"):
-        with open("mcp.json", "r") as f:
+    config_path = _get_mcp_config_path()
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
     for name, cfg in config.get("mcpServers", {}).items():

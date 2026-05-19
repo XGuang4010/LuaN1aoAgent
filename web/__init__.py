@@ -17,11 +17,12 @@
     然后访问: http://localhost:8000
 """
 
-try:
-    from web.server import app, register_graph
-    __all__ = ['app', 'register_graph']
-except ImportError:
-    # Web服务是可选的，如果依赖未安装则跳过
-    __all__ = []
+def create_app():
+    from .server import create_app as _create_app
+
+    return _create_app()
+
+
+__all__ = ["create_app"]
 
 __version__ = '1.0.0'
