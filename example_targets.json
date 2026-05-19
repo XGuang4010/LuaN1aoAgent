@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1,
+    "domain": "example.com",
+    "description": "示例网站",
+    "status": "pending",
+    "subdomains": [
+      {
+        "subdomain": "www.example.com",
+        "status": "pending",
+        "source": "manual"
+      },
+      {
+        "subdomain": "api.example.com",
+        "status": "pending",
+        "source": "manual"
+      }
+    ]
+  }
+]

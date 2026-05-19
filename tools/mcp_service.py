@@ -22,6 +22,7 @@ import json
 import subprocess
 import time
 import logging
+import shlex
 from typing import Dict, Any, List
 from http.server import BaseHTTPRequestHandler
 import sys
@@ -2287,6 +2288,390 @@ async def nuclei_list_templates(
         result["error"] = str(e)
     
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def subfinder_scan(
+    domain: str,
+    domain_target_id: int = None,
+    silent: bool = True,
+    extra_args: str = ""
+) -> str:
+    """
+    使用 Subfinder 进行子域名枚举扫描
+    
+    Args:
+        domain: 目标域名
+        domain_target_id: 可选，数据库中的域名目标ID
+        silent: 是否静默模式
+        extra_args: 额外的命令行参数
+    
+    Returns:
+        JSON格式的扫描结果
+    """
+    result = {
+        "status": "success",
+        "domain": domain,
+        "subdomains": [],
+        "count": 0,
+        "raw_output": ""
+    }
+    
+    try:
+        # 构建命令
+        cmd = ["subfinder", "-d", domain]
+        if silent:
+            cmd.append("-silent")
+        if extra_args:
+            cmd.extend(shlex.split(extra_args))
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        stdout_str = stdout.decode("utf-8", errors="replace")
+        stderr_str = stderr.decode("utf-8", errors="replace")
+        
+        result["raw_output"] = stdout_str
+        
+        # 解析子域名
+        subdomains = [line.strip() for line in stdout_str.split("\n") if line.strip()]
+        result["subdomains"] = subdomains
+        result["count"] = len(subdomains)
+        
+        # 如果提供了 domain_target_id，保存到数据库
+        if domain_target_id:
+            try:
+                # 导入数据库工具（延迟导入避免循环依赖）
+                sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                from core.database.utils import add_subdomain
+                
+                for subdomain in subdomains:
+                    await add_subdomain(
+                        domain_target_id,
+                        subdomain,
+                        source="subfinder"
+                    )
+            except Exception as db_error:
+                logger.warning(f"Failed to save subdomains to database: {db_error}")
+        
+        if process.returncode != 0 and stderr_str:
+            result["stderr"] = stderr_str
+            if not subdomains:
+                result["status"] = "failed"
+        
+    except FileNotFoundError:
+        result["status"] = "error"
+        result["error"] = "subfinder not found. Please install subfinder: https://github.com/projectdiscovery/subfinder"
+    except Exception as e:
+        logger.exception("subfinder_scan failed")
+        result["status"] = "error"
+        result["error"] = str(e)
+    
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def httpx_probe(
+    subdomains: List[str] = None,
+    domain_target_id: int = None,
+    ports: str = None,
+    status_code: bool = True,
+    title: bool = True,
+    tech_detect: bool = True
+) -> str:
+    """
+    使用 httpx 探测子域名的 HTTP 状态
+    
+    Args:
+        subdomains: 子域名列表
+        domain_target_id: 可选，数据库中的域名目标ID
+        ports: 要扫描的端口，例如 "80,443" 或 "80-90"
+        status_code: 是否获取状态码
+        title: 是否获取页面标题
+        tech_detect: 是否进行技术探测
+    
+    Returns:
+        JSON格式的探测结果
+    """
+    result = {
+        "status": "success",
+        "probed": [],
+        "count": 0,
+        "raw_output": ""
+    }
+    
+    if not subdomains:
+        result["status"] = "error"
+        result["error"] = "No subdomains provided"
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    
+    try:
+        # 构建命令
+        cmd = ["httpx"]
+        if ports:
+            cmd.extend(["-p", ports])
+        if status_code:
+            cmd.append("-sc")
+        if title:
+            cmd.append("-title")
+        if tech_detect:
+            cmd.append("-tech-detect")
+        cmd.append("-silent")
+        
+        # 将子域名写入临时文件
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            for sub in subdomains:
+                f.write(f"{sub}\n")
+            temp_file = f.name
+        
+        cmd.extend(["-l", temp_file])
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        
+        # 清理临时文件
+        try:
+            os.unlink(temp_file)
+        except:
+            pass
+        
+        stdout_str = stdout.decode("utf-8", errors="replace")
+        result["raw_output"] = stdout_str
+        
+        # 解析结果
+        probed = []
+        for line in stdout_str.strip().split("\n"):
+            if line.strip():
+                probed.append(line)
+        
+        result["probed"] = probed
+        result["count"] = len(probed)
+        
+        # 更新数据库中的状态码（如果提供了 domain_target_id）
+        if domain_target_id and probed:
+            try:
+                sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+                from core.database.utils import get_subdomains, update_subdomain_status
+                from sqlalchemy import select
+                from core.database.utils import AsyncSessionLocal
+                from core.database.models import Subdomain
+                
+                subdomain_cache = {}
+                async with AsyncSessionLocal() as session:
+                    db_subdomains = await session.execute(
+                        select(Subdomain).where(Subdomain.domain_target_id == domain_target_id)
+                    )
+                    for sd in db_subdomains.scalars().all():
+                        subdomain_cache[sd.subdomain] = sd
+                
+                # 简单解析，提取 URL 和状态码
+                for line in probed:
+                    parts = line.split()
+                    if parts:
+                        url = parts[0]
+                        # 提取子域名（去掉 http:// 或 https://）
+                        if url.startswith("http://"):
+                            subdomain = url[7:]
+                        elif url.startswith("https://"):
+                            subdomain = url[8:]
+                        else:
+                            subdomain = url
+                        
+                        # 去掉路径
+                        if "/" in subdomain:
+                            subdomain = subdomain.split("/", 1)[0]
+                        
+                        # 去掉端口
+                        if ":" in subdomain and not subdomain.endswith(("http", "https")):
+                            subdomain = subdomain.split(":", 1)[0]
+                        
+                        # 查找状态码
+                        status_code_val = None
+                        for part in parts:
+                            if len(part) == 3 and part.isdigit():
+                                status_code_val = int(part)
+                                break
+                        
+                        if subdomain in subdomain_cache:
+                            sd = subdomain_cache[subdomain]
+                            if status_code_val:
+                                sd.http_status = status_code_val
+                            sd.status = "tested"
+                
+                async with AsyncSessionLocal() as session:
+                    for sd in subdomain_cache.values():
+                        await session.merge(sd)
+                    await session.commit()
+                    
+            except Exception as db_error:
+                logger.warning(f"Failed to update subdomains in database: {db_error}")
+        
+        if process.returncode != 0:
+            stderr_str = stderr.decode("utf-8", errors="replace")
+            if stderr_str:
+                result["stderr"] = stderr_str
+            if not probed:
+                result["status"] = "failed"
+        
+    except FileNotFoundError:
+        result["status"] = "error"
+        result["error"] = "httpx not found. Please install httpx: https://github.com/projectdiscovery/httpx"
+    except Exception as e:
+        logger.exception("httpx_probe failed")
+        result["status"] = "error"
+        result["error"] = str(e)
+    
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def create_domain_target_db(
+    domain: str,
+    description: str = None
+) -> str:
+    """
+    在数据库中创建域名目标
+    
+    Args:
+        domain: 域名
+        description: 描述
+    
+    Returns:
+        JSON格式的创建结果，包含 domain_target_id
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from core.database.utils import create_domain_target
+        
+        domain_target = await create_domain_target(domain, description)
+        
+        return json.dumps({
+            "status": "success",
+            "domain_target_id": domain_target.id,
+            "domain": domain_target.domain,
+            "description": domain_target.description
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("create_domain_target_db failed")
+        return json.dumps({
+            "status": "error",
+            "error": str(e)
+        }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def export_domain_data_db(
+    domain_target_id: int = None,
+    output_path: str = "export.json"
+) -> str:
+    """
+    从数据库导出域名数据为 JSON
+    
+    Args:
+        domain_target_id: 可选，指定的域名目标ID，不指定则导出所有
+        output_path: 输出文件路径
+    
+    Returns:
+        JSON格式的导出结果
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from core.database.utils import export_to_json
+        
+        exported_path = await export_to_json(domain_target_id, output_path)
+        
+        return json.dumps({
+            "status": "success",
+            "output_path": exported_path
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("export_domain_data_db failed")
+        return json.dumps({
+            "status": "error",
+            "error": str(e)
+        }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def import_domain_data_db(
+    json_path: str
+) -> str:
+    """
+    从 JSON 文件导入域名数据到数据库
+    
+    Args:
+        json_path: JSON 文件路径
+    
+    Returns:
+        JSON格式的导入结果
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from core.database.utils import import_from_json
+        
+        imported_domains = await import_from_json(json_path)
+        
+        return json.dumps({
+            "status": "success",
+            "imported_count": len(imported_domains),
+            "domains": [dt.domain for dt in imported_domains]
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("import_domain_data_db failed")
+        return json.dumps({
+            "status": "error",
+            "error": str(e)
+        }, ensure_ascii=False, indent=2)
+
+
+@mcp.tool()
+async def list_domain_targets_db() -> str:
+    """
+    列出数据库中的所有域名目标
+    
+    Returns:
+        JSON格式的域名目标列表
+    """
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from core.database.utils import get_all_domain_targets, get_subdomains
+        
+        domain_targets = await get_all_domain_targets()
+        
+        result = []
+        for dt in domain_targets:
+            subdomains = await get_subdomains(dt.id)
+            result.append({
+                "id": dt.id,
+                "domain": dt.domain,
+                "description": dt.description,
+                "status": dt.status,
+                "created_at": dt.created_at.isoformat() if dt.created_at else None,
+                "subdomain_count": len(subdomains)
+            })
+        
+        return json.dumps({
+            "status": "success",
+            "count": len(result),
+            "domains": result
+        }, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.exception("list_domain_targets_db failed")
+        return json.dumps({
+            "status": "error",
+            "error": str(e)
+        }, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

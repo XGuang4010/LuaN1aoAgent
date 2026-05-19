@@ -9,7 +9,10 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy import select, update, delete, event
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .models import Base, SessionModel, GraphNodeModel, GraphEdgeModel, EventLogModel, InterventionModel
+from .models import (
+    Base, SessionModel, GraphNodeModel, GraphEdgeModel, EventLogModel, InterventionModel,
+    DomainTarget, Subdomain, ScanResult
+)
 
 # Default to a local SQLite database file
 DB_PATH = os.getenv("DATABASE_PATH", "luan1ao.db")
@@ -424,3 +427,261 @@ def schedule_coroutine(coro):
     except RuntimeError:
         # No running loop (shouldn't happen in Agent execution, but safe fallback)
         pass
+
+
+# ==================================================
+# 新增：域名和子域名管理的 CRUD 操作
+# ==================================================
+
+async def create_domain_target(domain: str, description: str = None) -> DomainTarget:
+    """创建或获取主域名目标"""
+    async with AsyncSessionLocal() as session:
+        # 检查是否已存在
+        result = await session.execute(
+            select(DomainTarget).where(DomainTarget.domain == domain)
+        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            return existing
+        
+        # 创建新的
+        domain_target = DomainTarget(
+            domain=domain,
+            description=description,
+            status="pending"
+        )
+        session.add(domain_target)
+        await session.commit()
+        await session.refresh(domain_target)
+        return domain_target
+
+
+async def add_subdomain(
+    domain_target_id: int, 
+    subdomain: str, 
+    ip_address: str = None, 
+    http_status: int = None,
+    source: str = None
+) -> Subdomain:
+    """添加子域名"""
+    async with AsyncSessionLocal() as session:
+        # 检查是否已存在
+        result = await session.execute(
+            select(Subdomain).where(
+                Subdomain.domain_target_id == domain_target_id,
+                Subdomain.subdomain == subdomain
+            )
+        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            return existing
+        
+        subdomain_obj = Subdomain(
+            domain_target_id=domain_target_id,
+            subdomain=subdomain,
+            ip_address=ip_address,
+            http_status=http_status,
+            source=source,
+            status="pending"
+        )
+        session.add(subdomain_obj)
+        await session.commit()
+        await session.refresh(subdomain_obj)
+        return subdomain_obj
+
+
+async def add_scan_result(
+    subdomain_id: int,
+    scan_type: str,
+    tool_name: str,
+    status: str,
+    findings: Dict[str, Any] = None,
+    raw_output: str = None
+) -> ScanResult:
+    """添加扫描结果"""
+    async with AsyncSessionLocal() as session:
+        scan_result = ScanResult(
+            subdomain_id=subdomain_id,
+            scan_type=scan_type,
+            tool_name=tool_name,
+            status=status,
+            findings=findings,
+            raw_output=raw_output,
+            started_at=datetime.now()
+        )
+        session.add(scan_result)
+        await session.commit()
+        await session.refresh(scan_result)
+        return scan_result
+
+
+async def update_scan_result_completed(scan_result_id: int):
+    """更新扫描结果为已完成"""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(ScanResult)
+            .where(ScanResult.id == scan_result_id)
+            .values(completed_at=datetime.now())
+        )
+        await session.commit()
+
+
+async def get_domain_target(domain: str) -> Optional[DomainTarget]:
+    """获取域名目标"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(DomainTarget).where(DomainTarget.domain == domain)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_domain_target_by_id(domain_id: int) -> Optional[DomainTarget]:
+    """通过 ID 获取域名目标"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(DomainTarget).where(DomainTarget.id == domain_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_all_domain_targets() -> List[DomainTarget]:
+    """获取所有域名目标"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(DomainTarget).order_by(DomainTarget.created_at.desc()))
+        return list(result.scalars().all())
+
+
+async def get_subdomains(domain_target_id: int) -> List[Subdomain]:
+    """获取域名的所有子域名"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(Subdomain).where(Subdomain.domain_target_id == domain_target_id)
+        )
+        return list(result.scalars().all())
+
+
+async def get_scan_results(subdomain_id: int) -> List[ScanResult]:
+    """获取子域名的所有扫描结果"""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ScanResult).where(ScanResult.subdomain_id == subdomain_id)
+        )
+        return list(result.scalars().all())
+
+
+async def update_subdomain_status(subdomain_id: int, status: str):
+    """更新子域名状态"""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(Subdomain)
+            .where(Subdomain.id == subdomain_id)
+            .values(status=status)
+        )
+        await session.commit()
+
+
+async def update_domain_target_status(domain_target_id: int, status: str):
+    """更新域名目标状态"""
+    async with AsyncSessionLocal() as session:
+        await session.execute(
+            update(DomainTarget)
+            .where(DomainTarget.id == domain_target_id)
+            .values(status=status, updated_at=datetime.now())
+        )
+        await session.commit()
+
+
+async def export_to_json(domain_target_id: int = None, output_path: str = "export.json"):
+    """导出数据为 JSON"""
+    async with AsyncSessionLocal() as session:
+        query = select(DomainTarget)
+        if domain_target_id:
+            query = query.where(DomainTarget.id == domain_target_id)
+        
+        result = await session.execute(query)
+        domain_targets = list(result.scalars().all())
+        
+        export_data = []
+        for dt in domain_targets:
+            # 获取子域名
+            subdomains_result = await session.execute(
+                select(Subdomain).where(Subdomain.domain_target_id == dt.id)
+            )
+            subdomains = list(subdomains_result.scalars().all())
+            
+            dt_data = {
+                "id": dt.id,
+                "domain": dt.domain,
+                "description": dt.description,
+                "status": dt.status,
+                "created_at": dt.created_at.isoformat() if dt.created_at else None,
+                "updated_at": dt.updated_at.isoformat() if dt.updated_at else None,
+                "subdomains": []
+            }
+            
+            for sd in subdomains:
+                # 获取扫描结果
+                scan_results_result = await session.execute(
+                    select(ScanResult).where(ScanResult.subdomain_id == sd.id)
+                )
+                scan_results = list(scan_results_result.scalars().all())
+                
+                sd_data = {
+                    "id": sd.id,
+                    "subdomain": sd.subdomain,
+                    "ip_address": sd.ip_address,
+                    "http_status": sd.http_status,
+                    "status": sd.status,
+                    "source": sd.source,
+                    "discovered_at": sd.discovered_at.isoformat() if sd.discovered_at else None,
+                    "scan_results": []
+                }
+                
+                for sr in scan_results:
+                    sd_data["scan_results"].append({
+                        "id": sr.id,
+                        "scan_type": sr.scan_type,
+                        "tool_name": sr.tool_name,
+                        "status": sr.status,
+                        "findings": sr.findings,
+                        "started_at": sr.started_at.isoformat() if sr.started_at else None,
+                        "completed_at": sr.completed_at.isoformat() if sr.completed_at else None
+                    })
+                
+                dt_data["subdomains"].append(sd_data)
+            
+            export_data.append(dt_data)
+        
+        # 写入文件
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(export_data, f, ensure_ascii=False, indent=2)
+        
+        return output_path
+
+
+async def import_from_json(json_path: str) -> List[DomainTarget]:
+    """从 JSON 导入数据"""
+    with open(json_path, "r", encoding="utf-8") as f:
+        import_data = json.load(f)
+    
+    imported_domains = []
+    async with AsyncSessionLocal() as session:
+        for dt_data in import_data:
+            # 创建或获取域名目标
+            domain_target = await create_domain_target(dt_data["domain"], dt_data.get("description"))
+            
+            for sd_data in dt_data.get("subdomains", []):
+                subdomain = await add_subdomain(
+                    domain_target.id,
+                    sd_data["subdomain"],
+                    sd_data.get("ip_address"),
+                    sd_data.get("http_status"),
+                    sd_data.get("source")
+                )
+                
+                if sd_data.get("status"):
+                    await update_subdomain_status(subdomain.id, sd_data["status"])
+            
+            imported_domains.append(domain_target)
+    
+    return imported_domains

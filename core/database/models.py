@@ -7,6 +7,61 @@ from sqlalchemy.sql import func
 class Base(DeclarativeBase):
     pass
 
+
+# ==================================================
+# 新增：子域名和目标管理相关模型
+# ==================================================
+
+class DomainTarget(Base):
+    """主域名目标表"""
+    __tablename__ = "domain_targets"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    domain: Mapped[str] = mapped_column(String, index=True, unique=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, scanning, completed, failed
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+    
+    # 关联
+    subdomains: Mapped[list["Subdomain"]] = relationship(back_populates="domain_target", cascade="all, delete-orphan")
+
+
+class Subdomain(Base):
+    """发现的子域名表"""
+    __tablename__ = "subdomains"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    domain_target_id: Mapped[int] = mapped_column(ForeignKey("domain_targets.id"), index=True)
+    subdomain: Mapped[str] = mapped_column(String, index=True)
+    ip_address: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    status: Mapped[str] = mapped_column(String, default="pending")  # pending, testing, tested, vulnerable
+    source: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # 发现来源
+    discovered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    
+    # 关联
+    domain_target: Mapped["DomainTarget"] = relationship(back_populates="subdomains")
+    scan_results: Mapped[list["ScanResult"]] = relationship(back_populates="subdomain", cascade="all, delete-orphan")
+
+
+class ScanResult(Base):
+    """扫描结果表"""
+    __tablename__ = "scan_results"
+    
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    subdomain_id: Mapped[int] = mapped_column(ForeignKey("subdomains.id"), index=True)
+    scan_type: Mapped[str] = mapped_column(String)  # dirsearch, nuclei, sqlmap, custom
+    tool_name: Mapped[str] = mapped_column(String)
+    status: Mapped[str] = mapped_column(String)  # success, failed, partial
+    findings: Mapped[Optional[JSON]] = mapped_column(JSON, nullable=True)
+    raw_output: Mapped[Optional[Text]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # 关联
+    subdomain: Mapped["Subdomain"] = relationship(back_populates="scan_results")
+
 class SessionModel(Base):
     __tablename__ = "sessions"
 
