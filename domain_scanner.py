@@ -5,11 +5,14 @@
 用于批量处理域名、发现子域名、导出导入数据
 """
 
+import argparse
 import asyncio
 import json
-import argparse
-import sys
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from typing import List, Dict, Any
 
 # 添加项目根目录
@@ -29,6 +32,27 @@ from core.database.utils import (
     import_from_json,
     add_scan_result
 )
+
+
+def _resolve_project_tool(tool_name: str) -> str | None:
+    """按单工具环境变量、TOOLS_HOME、PATH 的优先级解析扫描依赖。"""
+    mapping = {
+        "subfinder": ("SUBFINDER_PATH", os.path.join("subfinder", "subfinder.exe")),
+        "httpx": ("PD_HTTPX_PATH", os.path.join("httpx", "httpx.exe")),
+    }
+    env_var_name, tools_home_subpath = mapping[tool_name]
+
+    explicit = os.getenv(env_var_name, "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit
+
+    tools_home = os.getenv("TOOLS_HOME", "").strip()
+    if tools_home:
+        candidate = os.path.join(tools_home, tools_home_subpath)
+        if os.path.exists(candidate):
+            return candidate
+
+    return shutil.which(tool_name)
 
 
 async def cmd_add_domain(domain: str, description: str = None):
@@ -82,9 +106,9 @@ async def cmd_scan_subdomains(domain: str, use_subfinder: bool = True):
     if use_subfinder:
         try:
             print("  使用 subfinder 扫描...")
-            import subprocess
+            subfinder_executable = _resolve_project_tool("subfinder") or "subfinder"
             result = subprocess.run(
-                ["subfinder", "-d", domain, "-silent"],
+                [subfinder_executable, "-d", domain, "-silent"],
                 capture_output=True,
                 text=True,
                 timeout=300
@@ -107,16 +131,14 @@ async def cmd_scan_subdomains(domain: str, use_subfinder: bool = True):
     if subdomains:
         print("  使用 httpx 探测状态...")
         try:
-            import tempfile
-            import subprocess
-            
+            httpx_executable = _resolve_project_tool("httpx") or "httpx"
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
                 for sd in subdomains:
                     f.write(f"{sd}\n")
                 temp_file = f.name
             
             result = subprocess.run(
-                ["httpx", "-l", temp_file, "-sc", "-silent"],
+                [httpx_executable, "-l", temp_file, "-sc", "-silent"],
                 capture_output=True,
                 text=True,
                 timeout=300
