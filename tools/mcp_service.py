@@ -23,7 +23,6 @@ import subprocess
 import time
 import logging
 import shlex
-import shutil
 from typing import Dict, Any, List
 from http.server import BaseHTTPRequestHandler
 import sys
@@ -69,6 +68,7 @@ os.environ.setdefault("FASTMCP_NO_BANNER", "1")
 os.environ.setdefault("FASTMCP_LOG_LEVEL", "WARNING")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # 禁用 CUDA
 import warnings
+from tools.tool_env import resolve_project_tool
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -801,24 +801,15 @@ def _resolve_external_tool(
     tools_home_subpath: str,
     fallback_names: list[str] | None = None,
 ) -> str | None:
-    """按显式环境变量、TOOLS_HOME、PATH 的优先级解析外部工具。"""
+    """只通过项目根目录 .env 解析外部工具路径。"""
 
-    explicit = os.getenv(env_var_name, "").strip()
-    if explicit and os.path.exists(explicit):
-        return explicit
+    del fallback_names
 
-    tools_home = os.getenv("TOOLS_HOME", "").strip()
-    if tools_home:
-        candidate = os.path.join(tools_home, tools_home_subpath)
-        if os.path.exists(candidate):
-            return candidate
-
-    for name in [tool_name, *(fallback_names or [])]:
-        resolved = shutil.which(name)
-        if resolved:
-            return resolved
-
-    return None
+    return resolve_project_tool(
+        tool_name=tool_name,
+        env_var_name=env_var_name,
+        tools_home_subpath=tools_home_subpath,
+    )
 
 
 def _is_compatible_projectdiscovery_httpx(help_text: str) -> bool:
@@ -837,26 +828,13 @@ def _is_compatible_projectdiscovery_httpx(help_text: str) -> bool:
 def _resolve_httpx_executable() -> str | None:
     """解析并验证可用的 ProjectDiscovery httpx 可执行文件。"""
 
-    explicit_env = os.getenv("PD_HTTPX_PATH", "").strip()
-    tools_home = os.getenv("TOOLS_HOME", "").strip()
-    tools_home_candidate = (
-        os.path.join(tools_home, "httpx", "httpx.exe") if tools_home else None
-    )
-    resolved = _resolve_external_tool(
+    resolved = resolve_project_tool(
         tool_name="httpx",
         env_var_name="PD_HTTPX_PATH",
-        tools_home_subpath=os.path.join("httpx", "httpx.exe"),
+        tools_home_subpath=r"httpx\httpx.exe",
     )
     if not resolved:
         return None
-
-    if explicit_env and os.path.normcase(resolved) == os.path.normcase(explicit_env):
-        return resolved
-
-    if tools_home_candidate and os.path.normcase(resolved) == os.path.normcase(
-        tools_home_candidate
-    ):
-        return resolved
 
     try:
         result = subprocess.run(
@@ -909,7 +887,7 @@ async def sqlmap_tool(
         return json.dumps(
             {
                 "success": False,
-                "error": "sqlmap command not found. Checked SQLMAP_PATH, TOOLS_HOME, and PATH.",
+                "error": "sqlmap not configured. Checked SQLMAP_PATH and TOOLS_HOME/sqlmap/sqlmap.exe from project .env only.",
                 "error_type": "TOOL_MISSING",
             },
             ensure_ascii=False,
@@ -971,7 +949,7 @@ async def sqlmap_tool(
     except FileNotFoundError:
         return json.dumps({
             "success": False,
-            "error": "sqlmap command not found. Please ensure sqlmap is installed and in the system PATH.",
+            "error": "sqlmap executable missing after resolution from project .env.",
             "error_type": "TOOL_MISSING"
         }, ensure_ascii=False)
     except Exception as e:
@@ -1086,7 +1064,7 @@ def _classify_dirsearch_failure(output: str, return_code: int) -> Dict[str, Any]
         or "not found" in lowered_output
     ):
         error_type = "MISSING_TOOL"
-        fix_suggestion = "Install dirsearch or ensure it is available in PATH."
+        fix_suggestion = "Set DIRSEARCH_PATH or TOOLS_HOME/dirsearch/dirsearch.exe in the project root .env."
     elif "no such option" in lowered_output or "unrecognized arguments" in lowered_output:
         error_type = "INVALID_ARGS"
         fix_suggestion = "Some arguments are not supported by the installed dirsearch version."
@@ -1116,8 +1094,8 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
                 "success": False,
                 "output": "",
                 "error_type": "MISSING_TOOL",
-                "message": "dirsearch command not found.",
-                "fix_suggestion": "Install dirsearch or ensure DIRSEARCH_PATH / TOOLS_HOME / PATH is configured.",
+                "message": "dirsearch not configured.",
+                "fix_suggestion": "Set DIRSEARCH_PATH or TOOLS_HOME/dirsearch/dirsearch.exe in the project root .env.",
                 "warnings": [],
             },
             ensure_ascii=False,
@@ -2006,7 +1984,7 @@ async def _search_exploitdb(keywords: str, cve_id: str, max_results: int) -> Lis
             os.path.join("searchsploit", "searchsploit.exe"),
         )
         if not searchsploit_executable:
-            logger.warning("searchsploit not found via SEARCHSPLOIT_PATH / TOOLS_HOME / PATH, falling back to web search")
+            logger.warning("searchsploit not configured in project .env, falling back to web search")
             return await _search_exploitdb_web(keywords, cve_id, max_results)
 
         # 构建搜索参数
@@ -2157,7 +2135,7 @@ async def view_exploit(
             )
             if not searchsploit_executable:
                 result["status"] = "error"
-                result["error"] = "searchsploit not installed. Checked SEARCHSPLOIT_PATH, TOOLS_HOME, and PATH."
+                result["error"] = "searchsploit not configured. Checked SEARCHSPLOIT_PATH and TOOLS_HOME/searchsploit/searchsploit.exe from project .env only."
                 return json.dumps(result, ensure_ascii=False, indent=2)
 
             # 使用 searchsploit -p 获取路径信息
@@ -2334,7 +2312,7 @@ async def nuclei_scan(
         )
         if not nuclei_executable:
             result["status"] = "error"
-            result["error"] = "nuclei not installed. Checked NUCLEI_PATH, TOOLS_HOME, and PATH."
+            result["error"] = "nuclei not configured. Checked NUCLEI_PATH and TOOLS_HOME/nuclei/nuclei.exe from project .env only."
             return json.dumps(result, ensure_ascii=False, indent=2)
 
         # 构建 nuclei 命令
@@ -2468,7 +2446,7 @@ async def nuclei_list_templates(
         )
         if not nuclei_executable:
             result["status"] = "error"
-            result["error"] = "nuclei not installed. Checked NUCLEI_PATH, TOOLS_HOME, and PATH."
+            result["error"] = "nuclei not configured. Checked NUCLEI_PATH and TOOLS_HOME/nuclei/nuclei.exe from project .env only."
             return json.dumps(result, ensure_ascii=False, indent=2)
 
         # 构建命令
@@ -2553,7 +2531,7 @@ async def subfinder_scan(
         )
         if not subfinder_executable:
             result["status"] = "error"
-            result["error"] = "subfinder not found. Checked SUBFINDER_PATH, TOOLS_HOME, and PATH."
+            result["error"] = "subfinder not configured. Checked SUBFINDER_PATH and TOOLS_HOME/subfinder/subfinder.exe from project .env only."
             return json.dumps(result, ensure_ascii=False, indent=2)
 
         # 构建命令
@@ -2652,7 +2630,7 @@ async def httpx_probe(
         httpx_executable = _resolve_httpx_executable()
         if not httpx_executable:
             result["status"] = "error"
-            result["error"] = "httpx not found or incompatible. Checked PD_HTTPX_PATH, TOOLS_HOME, and PATH."
+            result["error"] = "httpx not configured or incompatible. Checked PD_HTTPX_PATH and TOOLS_HOME/httpx/httpx.exe from project .env only."
             return json.dumps(result, ensure_ascii=False, indent=2)
 
         # 构建命令
