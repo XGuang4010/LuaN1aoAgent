@@ -9,7 +9,6 @@ import argparse
 import asyncio
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -32,27 +31,21 @@ from core.database.utils import (
     import_from_json,
     add_scan_result
 )
+from tools.tool_env import resolve_project_tool
 
 
 def _resolve_project_tool(tool_name: str) -> str | None:
-    """按单工具环境变量、TOOLS_HOME、PATH 的优先级解析扫描依赖。"""
+    """只通过项目根目录 .env 解析扫描依赖。"""
     mapping = {
-        "subfinder": ("SUBFINDER_PATH", os.path.join("subfinder", "subfinder.exe")),
-        "httpx": ("PD_HTTPX_PATH", os.path.join("httpx", "httpx.exe")),
+        "subfinder": ("SUBFINDER_PATH", r"subfinder\subfinder.exe"),
+        "httpx": ("PD_HTTPX_PATH", r"httpx\httpx.exe"),
     }
     env_var_name, tools_home_subpath = mapping[tool_name]
-
-    explicit = os.getenv(env_var_name, "").strip()
-    if explicit and os.path.exists(explicit):
-        return explicit
-
-    tools_home = os.getenv("TOOLS_HOME", "").strip()
-    if tools_home:
-        candidate = os.path.join(tools_home, tools_home_subpath)
-        if os.path.exists(candidate):
-            return candidate
-
-    return shutil.which(tool_name)
+    return resolve_project_tool(
+        tool_name=tool_name,
+        env_var_name=env_var_name,
+        tools_home_subpath=tools_home_subpath,
+    )
 
 
 async def cmd_add_domain(domain: str, description: str = None):
@@ -104,9 +97,15 @@ async def cmd_scan_subdomains(domain: str, use_subfinder: bool = True):
     
     # 使用 subfinder 扫描
     if use_subfinder:
+        subfinder_executable = _resolve_project_tool("subfinder")
+        if not subfinder_executable:
+            raise RuntimeError(
+                "subfinder not configured. Checked SUBFINDER_PATH and "
+                "TOOLS_HOME/subfinder/subfinder.exe from project .env only."
+            )
+
         try:
             print("  使用 subfinder 扫描...")
-            subfinder_executable = _resolve_project_tool("subfinder") or "subfinder"
             result = subprocess.run(
                 [subfinder_executable, "-d", domain, "-silent"],
                 capture_output=True,
@@ -129,9 +128,15 @@ async def cmd_scan_subdomains(domain: str, use_subfinder: bool = True):
     
     # 探测 HTTP 状态
     if subdomains:
+        httpx_executable = _resolve_project_tool("httpx")
+        if not httpx_executable:
+            raise RuntimeError(
+                "httpx not configured. Checked PD_HTTPX_PATH and "
+                "TOOLS_HOME/httpx/httpx.exe from project .env only."
+            )
+
         print("  使用 httpx 探测状态...")
         try:
-            httpx_executable = _resolve_project_tool("httpx") or "httpx"
             with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False, encoding='utf-8') as f:
                 for sd in subdomains:
                     f.write(f"{sd}\n")
