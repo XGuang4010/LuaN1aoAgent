@@ -795,6 +795,85 @@ async def python_exec(script: str) -> str:
          return json.dumps({"success": False, "error": f"Thread Error: {str(e)}"}, ensure_ascii=False)
 
 
+def _resolve_external_tool(
+    tool_name: str,
+    env_var_name: str,
+    tools_home_subpath: str,
+    fallback_names: list[str] | None = None,
+) -> str | None:
+    """按显式环境变量、TOOLS_HOME、PATH 的优先级解析外部工具。"""
+
+    explicit = os.getenv(env_var_name, "").strip()
+    if explicit and os.path.exists(explicit):
+        return explicit
+
+    tools_home = os.getenv("TOOLS_HOME", "").strip()
+    if tools_home:
+        candidate = os.path.join(tools_home, tools_home_subpath)
+        if os.path.exists(candidate):
+            return candidate
+
+    for name in [tool_name, *(fallback_names or [])]:
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+
+    return None
+
+
+def _is_compatible_projectdiscovery_httpx(help_text: str) -> bool:
+    """检查是否为 ProjectDiscovery 的 httpx，而不是 Python HTTPX CLI。"""
+
+    lowered = help_text.lower()
+    if "a next generation http client" in lowered:
+        return False
+    return (
+        "projectdiscovery" in lowered
+        or "http toolkit" in lowered
+        or "-tech-detect" in lowered
+    )
+
+
+def _resolve_httpx_executable() -> str | None:
+    """解析并验证可用的 ProjectDiscovery httpx 可执行文件。"""
+
+    explicit_env = os.getenv("PD_HTTPX_PATH", "").strip()
+    tools_home = os.getenv("TOOLS_HOME", "").strip()
+    tools_home_candidate = (
+        os.path.join(tools_home, "httpx", "httpx.exe") if tools_home else None
+    )
+    resolved = _resolve_external_tool(
+        tool_name="httpx",
+        env_var_name="PD_HTTPX_PATH",
+        tools_home_subpath=os.path.join("httpx", "httpx.exe"),
+    )
+    if not resolved:
+        return None
+
+    if explicit_env and os.path.normcase(resolved) == os.path.normcase(explicit_env):
+        return resolved
+
+    if tools_home_candidate and os.path.normcase(resolved) == os.path.normcase(
+        tools_home_candidate
+    ):
+        return resolved
+
+    try:
+        result = subprocess.run(
+            [resolved, "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        help_text = f"{result.stdout}\n{result.stderr}"
+        if _is_compatible_projectdiscovery_httpx(help_text):
+            return resolved
+    except Exception:
+        pass
+
+    return None
+
+
 
 @mcp.tool()
 async def sqlmap_tool(
@@ -821,7 +900,22 @@ async def sqlmap_tool(
     Returns:
         JSON string containing the execution result (stdout/stderr).
     """
-    cmd = ["sqlmap"]
+    sqlmap_executable = _resolve_external_tool(
+        "sqlmap",
+        "SQLMAP_PATH",
+        os.path.join("sqlmap", "sqlmap.exe"),
+    )
+    if not sqlmap_executable:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "sqlmap command not found. Checked SQLMAP_PATH, TOOLS_HOME, and PATH.",
+                "error_type": "TOOL_MISSING",
+            },
+            ensure_ascii=False,
+        )
+
+    cmd = [sqlmap_executable]
     
     if url:
         cmd.extend(["-u", url])
@@ -885,15 +979,15 @@ async def sqlmap_tool(
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
 
 
-def _resolve_dirsearch_executable() -> str:
+def _resolve_dirsearch_executable() -> str | None:
     """解析可用的 dirsearch 可执行文件。"""
 
-    candidates = ["dirsearch", "dirsearch.py"]
-    for candidate in candidates:
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    return "dirsearch"
+    return _resolve_external_tool(
+        tool_name="dirsearch",
+        env_var_name="DIRSEARCH_PATH",
+        tools_home_subpath=os.path.join("dirsearch", "dirsearch.exe"),
+        fallback_names=["dirsearch.py"],
+    )
 
 
 def _split_dirsearch_args(extra_args: str) -> List[str]:
@@ -1016,6 +1110,18 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
     :return: 扫描结果
     """
     executable = _resolve_dirsearch_executable()
+    if not executable:
+        return json.dumps(
+            {
+                "success": False,
+                "output": "",
+                "error_type": "MISSING_TOOL",
+                "message": "dirsearch command not found.",
+                "fix_suggestion": "Install dirsearch or ensure DIRSEARCH_PATH / TOOLS_HOME / PATH is configured.",
+                "warnings": [],
+            },
+            ensure_ascii=False,
+        )
     normalized_args, warnings_list = _normalize_dirsearch_args(extra_args)
     cmd = [executable, "-u", url, "-e", extensions, "-q", *normalized_args]
     output_lines = []
@@ -1894,12 +2000,21 @@ async def _search_exploitdb(keywords: str, cve_id: str, max_results: int) -> Lis
     exploits = []
     
     try:
+        searchsploit_executable = _resolve_external_tool(
+            "searchsploit",
+            "SEARCHSPLOIT_PATH",
+            os.path.join("searchsploit", "searchsploit.exe"),
+        )
+        if not searchsploit_executable:
+            logger.warning("searchsploit not found via SEARCHSPLOIT_PATH / TOOLS_HOME / PATH, falling back to web search")
+            return await _search_exploitdb_web(keywords, cve_id, max_results)
+
         # 构建搜索参数
         if cve_id:
-            search_args = ["searchsploit", "--cve", cve_id.replace("CVE-", ""), "-j"]
+            search_args = [searchsploit_executable, "--cve", cve_id.replace("CVE-", ""), "-j"]
         else:
             # 分割关键词
-            search_args = ["searchsploit", "-j"] + keywords.split()
+            search_args = [searchsploit_executable, "-j"] + keywords.split()
         
         # 执行命令
         result = subprocess.run(
@@ -2035,9 +2150,19 @@ async def view_exploit(
     
     try:
         if edb_id:
+            searchsploit_executable = _resolve_external_tool(
+                "searchsploit",
+                "SEARCHSPLOIT_PATH",
+                os.path.join("searchsploit", "searchsploit.exe"),
+            )
+            if not searchsploit_executable:
+                result["status"] = "error"
+                result["error"] = "searchsploit not installed. Checked SEARCHSPLOIT_PATH, TOOLS_HOME, and PATH."
+                return json.dumps(result, ensure_ascii=False, indent=2)
+
             # 使用 searchsploit -p 获取路径信息
             path_result = subprocess.run(
-                ["searchsploit", "-p", str(edb_id)],
+                [searchsploit_executable, "-p", str(edb_id)],
                 capture_output=True,
                 text=True,
                 timeout=10
@@ -2202,9 +2327,19 @@ async def nuclei_scan(
     }
     
     try:
+        nuclei_executable = _resolve_external_tool(
+            "nuclei",
+            "NUCLEI_PATH",
+            os.path.join("nuclei", "nuclei.exe"),
+        )
+        if not nuclei_executable:
+            result["status"] = "error"
+            result["error"] = "nuclei not installed. Checked NUCLEI_PATH, TOOLS_HOME, and PATH."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
         # 构建 nuclei 命令
         cmd = [
-            "nuclei",
+            nuclei_executable,
             "-u", target,
             "-jsonl",  # JSON Lines 输出
             "-silent",  # 减少噪音
@@ -2326,8 +2461,18 @@ async def nuclei_list_templates(
     }
     
     try:
+        nuclei_executable = _resolve_external_tool(
+            "nuclei",
+            "NUCLEI_PATH",
+            os.path.join("nuclei", "nuclei.exe"),
+        )
+        if not nuclei_executable:
+            result["status"] = "error"
+            result["error"] = "nuclei not installed. Checked NUCLEI_PATH, TOOLS_HOME, and PATH."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
         # 构建命令
-        cmd = ["nuclei", "-tl"]  # template list
+        cmd = [nuclei_executable, "-tl"]  # template list
         
         if tags:
             cmd.extend(["-tags", tags])
@@ -2401,8 +2546,18 @@ async def subfinder_scan(
     }
     
     try:
+        subfinder_executable = _resolve_external_tool(
+            "subfinder",
+            "SUBFINDER_PATH",
+            os.path.join("subfinder", "subfinder.exe"),
+        )
+        if not subfinder_executable:
+            result["status"] = "error"
+            result["error"] = "subfinder not found. Checked SUBFINDER_PATH, TOOLS_HOME, and PATH."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
         # 构建命令
-        cmd = ["subfinder", "-d", domain]
+        cmd = [subfinder_executable, "-d", domain]
         if silent:
             cmd.append("-silent")
         if extra_args:
@@ -2494,8 +2649,14 @@ async def httpx_probe(
         return json.dumps(result, ensure_ascii=False, indent=2)
     
     try:
+        httpx_executable = _resolve_httpx_executable()
+        if not httpx_executable:
+            result["status"] = "error"
+            result["error"] = "httpx not found or incompatible. Checked PD_HTTPX_PATH, TOOLS_HOME, and PATH."
+            return json.dumps(result, ensure_ascii=False, indent=2)
+
         # 构建命令
-        cmd = ["httpx"]
+        cmd = [httpx_executable]
         if ports:
             cmd.extend(["-p", ports])
         if status_code:
