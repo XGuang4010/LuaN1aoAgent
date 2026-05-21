@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import httpx
 import json
 import re
+import json5  # 宽松 JSON 解析器，原生支持尾随逗号、单引号、注释
 from rich.panel import Panel
 from conf.config import (
     LLM_PROVIDER,
@@ -184,10 +185,17 @@ class LLMClient:
                 payload["extra_body"] = {"thinking": thinking_mode}
 
         # 强制 JSON 输出
-        if expect_json:
+        if expect_json and self._supports_json_object_response_format(model_name):
             payload["response_format"] = {"type": "json_object"}
 
         return headers, payload
+
+    def _supports_json_object_response_format(self, model_name: str) -> bool:
+        """Return whether the model can safely accept response_format=json_object."""
+        normalized_model_name = (model_name or "").strip().lower()
+
+        # Known incompatible OpenAI-compatible models should fall back to prompt-only JSON.
+        return not normalized_model_name.startswith("glm-")
 
     async def _extract_response_content(self, api_response_json: dict, model_name: str) -> tuple[str, dict]:
         """
@@ -631,7 +639,7 @@ class LLMClient:
         # 4. 应用轻度纠错
         candidate_fixed = self._apply_soft_fixes(candidate)
 
-        # 5. 尝试解析修夊后的字符串
+        # 5. 尝试解析修夊后的字符串（优先 json，回退到 json5）
         try:
             parsed = json.loads(candidate_fixed)
             if isinstance(parsed, list):
@@ -639,12 +647,19 @@ class LLMClient:
             if isinstance(parsed, dict):
                 return parsed
             return None
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
+            try:
+                # json5 原生支持尾随逗号、单引号、注释等 LLM 常见输出格式
+                parsed = json5.loads(candidate_fixed)
+                if isinstance(parsed, list):
+                    return {"list": parsed}
+                if isinstance(parsed, dict):
+                    return parsed
+            except ValueError:
+                pass
             self._get_console().print(
-                Panel(f"JSON解析失败: {e}\n原始字符串 (清理后): {candidate_fixed[:500]}...", title="警告", style="yellow")
+                Panel(f"JSON解析失败: \n原始字符串 (清理后): {candidate_fixed[:500]}...", title="警告", style="yellow")
             )
-            return None
-        except Exception:
             return None
 
 

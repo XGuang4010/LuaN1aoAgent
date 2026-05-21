@@ -7,7 +7,7 @@ from rich.console import Console
 from typing import TextIO, Any
 import sys
 
-_console = Console()
+_console = Console(markup=False)
 
 
 def get_console() -> Console:
@@ -81,7 +81,7 @@ def init_console_with_file(log_file: TextIO) -> Console:
         pass
 
     global _console
-    _console = Console(file=multi_writer, force_terminal=is_terminal)
+    _console = Console(file=multi_writer, force_terminal=is_terminal, markup=False)
     return _console
 
 

@@ -2,8 +2,11 @@
   "mcpServers": {
     "tools": {
       "type": "stdio",
-      "command": "python",
-      "args": ["-u", "./tools/mcp_service.py"],
+      "command": "D:\\Projects\\LuaN1aoAgent\\venv\\Scripts\\python.exe",
+      "args": [
+        "-u",
+        "./tools/mcp_service.py"
+      ],
       "env": {
         "FASTMCP_NO_BANNER": "1",
         "FASTMCP_LOG_LEVEL": "WARNING"

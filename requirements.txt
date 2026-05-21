@@ -23,5 +23,6 @@ httpx
 psutil
 rich
 fastmcp
+json5
 mcp
 prompt_toolkit
