@@ -1,26 +1,26 @@
 import asyncio
+from contextlib import asynccontextmanager
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import subprocess
 import uuid
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 from datetime import datetime
 
-from fastapi import FastAPI, HTTPException, Request, Query
-from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
-from fastapi.responses import Response
 
-from sqlalchemy import select, desc, update, delete
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, desc, update
 from core.database.utils import (
-    get_db_session,
     init_db,
     AsyncSessionLocal,
     get_pending_intervention_request,
@@ -37,32 +37,71 @@ _sse_logger = logging.getLogger("web.sse")
 # 用于在终止任务时直接kill进程
 _running_processes: Dict[str, subprocess.Popen] = {}
 
-app = FastAPI(title="鸾鸟自主渗透系统 Web (DB Mode)")
+WEB_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = WEB_DIR.parent
+STATIC_DIR = WEB_DIR / "static"
+TEMPLATES_DIR = WEB_DIR / "templates"
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# Mount static files and templates
-os.makedirs("web/static", exist_ok=True)
-os.makedirs("web/templates", exist_ok=True)
+class OpsReorderPayload(BaseModel):
+    order: list[str] = Field(default_factory=list)
 
-app.mount("/static", StaticFiles(directory="web/static"), name="static")
-templates = Jinja2Templates(directory="web/templates")
 
-@app.on_event("startup")
-async def startup_event():
+class InterventionDecisionPayload(BaseModel):
+    id: str
+    action: str
+    modified_data: Dict[str, Any] | None = None
+
+
+class InjectTaskPayload(BaseModel):
+    description: str
+    dependencies: list[str] = Field(default_factory=list)
+
+
+class McpAddPayload(BaseModel):
+    name: str
+    command: str
+    args: list[str] = Field(default_factory=list)
+    env: Dict[str, str] = Field(default_factory=dict)
+
+
+class RenameOpPayload(BaseModel):
+    name: str
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
     await init_db()
+    yield
+
+
+def _build_app() -> FastAPI:
+    app = FastAPI(title="鸾鸟自主渗透系统 Web (DB Mode)", lifespan=lifespan)
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    STATIC_DIR.mkdir(exist_ok=True)
+    TEMPLATES_DIR.mkdir(exist_ok=True)
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    return app
+
+
+app = _build_app()
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
+
+
+def create_app() -> FastAPI:
+    return app
 
 # --- Helper Functions for Graph Reconstruction ---
 
 
 def _get_mcp_config_path() -> str:
-    return os.path.join(os.getcwd(), "mcp.json")
+    return str(PROJECT_ROOT / "mcp.json")
 
 
 def _load_mcp_config() -> Dict[str, Any]:
@@ -246,11 +285,9 @@ async def api_ops():
         return {"items": items}
 
 @app.post("/api/ops/reorder")
-async def api_ops_reorder(payload: Dict[str, Any]):
+async def api_ops_reorder(payload: OpsReorderPayload):
     """持久化保存任务列表顺序"""
-    order = payload.get("order") or []
-    if not isinstance(order, list):
-        raise HTTPException(status_code=400, detail="order must be a list of op_ids")
+    order = payload.order
 
     async with AsyncSessionLocal() as session:
         for idx, op_id in enumerate(order):
@@ -361,10 +398,10 @@ async def api_get_pending_intervention(op_id: str):
     return {"pending": req is not None, "request": req}
 
 @app.post("/api/ops/{op_id}/intervention/decision")
-async def api_submit_intervention_decision(op_id: str, payload: Dict[str, Any]):
-    req_id = payload.get("id") # The request ID comes from the frontend
-    action = payload.get("action")
-    modified_data = payload.get("modified_data")
+async def api_submit_intervention_decision(op_id: str, payload: InterventionDecisionPayload):
+    req_id = payload.id  # The request ID comes from the frontend
+    action = payload.action
+    modified_data = payload.modified_data
     if not req_id or not action:
         raise HTTPException(status_code=400, detail="req_id and action are required")
     
@@ -375,13 +412,11 @@ async def api_submit_intervention_decision(op_id: str, payload: Dict[str, Any]):
 
 
 @app.post("/api/ops/{op_id}/inject_task")
-async def api_ops_inject_task(op_id: str, payload: Dict[str, Any]):
-    description = (payload.get("description") or "").strip()
-    dependencies = payload.get("dependencies") or []
+async def api_ops_inject_task(op_id: str, payload: InjectTaskPayload):
+    description = payload.description.strip()
+    dependencies = payload.dependencies
     if not description:
         raise HTTPException(status_code=400, detail="description is required")
-    if not isinstance(dependencies, list):
-        raise HTTPException(status_code=400, detail="dependencies must be a list")
 
     req_id = f"inject_{int(time.time())}_{str(uuid.uuid4())[:8]}"
     request_data = {
@@ -398,18 +433,14 @@ async def api_mcp_config():
 
 
 @app.post("/api/mcp/add")
-async def api_mcp_add(payload: Dict[str, Any]):
-    name = (payload.get("name") or "").strip()
-    command = (payload.get("command") or "").strip()
-    args = payload.get("args") or []
-    env = payload.get("env") or {}
+async def api_mcp_add(payload: McpAddPayload):
+    name = payload.name.strip()
+    command = payload.command.strip()
+    args = payload.args
+    env = payload.env
 
     if not name or not command:
         raise HTTPException(status_code=400, detail="name and command are required")
-    if not isinstance(args, list):
-        raise HTTPException(status_code=400, detail="args must be a list")
-    if not isinstance(env, dict):
-        raise HTTPException(status_code=400, detail="env must be an object")
 
     config = _load_mcp_config()
     config.setdefault("mcpServers", {})
@@ -475,9 +506,9 @@ async def api_ops_abort(op_id: str):
     }
 
 @app.patch("/api/ops/{op_id}")
-async def api_ops_rename(op_id: str, payload: Dict[str, Any]):
+async def api_ops_rename(op_id: str, payload: RenameOpPayload):
     """重命名任务（更新显示名称）"""
-    new_name = (payload.get("name") or "").strip()
+    new_name = payload.name.strip()
     
     if not new_name:
         raise HTTPException(status_code=400, detail="Name is required")
@@ -505,10 +536,52 @@ async def api_ops_delete(op_id: str):
         s = result.scalar_one_or_none()
         if not s:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
         await session.delete(s)
         await session.commit()
     return {"ok": True}
+
+@app.get("/api/scope-defaults")
+async def get_scope_defaults():
+    """获取默认 Scope 配置"""
+    from conf.config import SCOPE_DEFAULTS
+    return {"defaults": SCOPE_DEFAULTS}
+
+@app.get("/api/ops/{op_id}/scope")
+async def get_scope_config(op_id: str):
+    """获取任务的 Scope 配置"""
+    from core.database.models import ScopeRuleModel
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ScopeRuleModel).where(ScopeRuleModel.session_id == op_id)
+        )
+        rule = result.scalar_one_or_none()
+        if rule:
+            return {"scope_config": rule.scope_config}
+        return {"scope_config": None}
+
+@app.post("/api/ops/{op_id}/scope")
+async def set_scope_config(op_id: str, request: Request):
+    """设置任务的 Scope 配置"""
+    from core.database.models import ScopeRuleModel
+    data = await request.json()
+    scope_config = data.get("scope_config", {})
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ScopeRuleModel).where(ScopeRuleModel.session_id == op_id)
+        )
+        rule = result.scalar_one_or_none()
+        if rule:
+            rule.scope_config = scope_config
+        else:
+            rule = ScopeRuleModel(
+                id=str(uuid.uuid4()),
+                session_id=op_id,
+                scope_config=scope_config
+            )
+            session.add(rule)
+        await session.commit()
+    return {"success": True, "scope_config": scope_config}
 
 @app.get("/api/events")
 async def api_events(request: Request, op_id: str):
@@ -664,7 +737,7 @@ async def api_ops_create(payload: Dict[str, Any]):
     # Ensure it runs within the same virtual environment as the web server
     command = [
         sys.executable,  # Path to the current python interpreter (inside venv)
-        os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "agent.py")),
+        str(PROJECT_ROOT / "agent.py"),
         "--goal", goal,
         "--task-name", task_name,
         "--op-id", op_id, # Pass the generated op_id to the agent
@@ -711,14 +784,25 @@ async def api_ops_create(payload: Dict[str, Any]):
             await session.commit()
             _sse_logger.info(f"Session '{op_id}' created in database")
 
+            # 自动从默认值创建 ScopeRuleModel 记录
+            from conf.config import SCOPE_DEFAULTS
+            from core.database.models import ScopeRuleModel
+            scope_rule = ScopeRuleModel(
+                id=str(uuid.uuid4()),
+                session_id=op_id,
+                scope_config=SCOPE_DEFAULTS.copy()
+            )
+            session.add(scope_rule)
+            await session.commit()
+
         # Use start_new_session=True to detach the child process from the current process group
         # This makes the child process independent of the web server's lifespan
         
         # Create log files for stdout and stderr to help debug issues
-        log_base_dir = os.path.join(os.path.dirname(__file__), "..", "logs", task_name)
-        os.makedirs(log_base_dir, exist_ok=True)
-        stdout_log = open(os.path.join(log_base_dir, f"{op_id}_stdout.log"), "w")
-        stderr_log = open(os.path.join(log_base_dir, f"{op_id}_stderr.log"), "w")
+        log_base_dir = PROJECT_ROOT / "logs" / task_name
+        log_base_dir.mkdir(parents=True, exist_ok=True)
+        stdout_log = open(log_base_dir / f"{op_id}_stdout.log", "w")
+        stderr_log = open(log_base_dir / f"{op_id}_stderr.log", "w")
         
         process = subprocess.Popen(command, start_new_session=True, 
                                    stdout=stdout_log,  # Log stdout to file
@@ -746,7 +830,7 @@ async def api_ops_create(payload: Dict[str, Any]):
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    return templates.TemplateResponse(request=request, name="index.html")
 
 if __name__ == "__main__":
     import uvicorn

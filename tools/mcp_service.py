@@ -22,7 +22,7 @@ import json
 import subprocess
 import time
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from http.server import BaseHTTPRequestHandler
 import sys
 import os
@@ -62,6 +62,16 @@ except ImportError as e:
     FastMCP = None
     Server = None
 
+# 尝试导入 Context（用于工具上下文注入）
+Context = None
+try:
+    from mcp.server.fastmcp import Context
+except ImportError:
+    try:
+        from fastmcp import Context
+    except ImportError:
+        pass
+
 # 设置环境变量，抑制不必要的输出和警告
 os.environ.setdefault("FASTMCP_NO_BANNER", "1")
 os.environ.setdefault("FASTMCP_LOG_LEVEL", "WARNING")
@@ -70,6 +80,9 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+from tools.tool_env import resolve_project_tool
+from core.boundary import ScopeConfig, BoundaryValidator, BoundaryCheckResult
 
 # 配置日志
 # Ensure logs directory exists
@@ -574,13 +587,16 @@ async def web_search(query: str, num_results: int = 5) -> str:
 
 
 @mcp.tool()
-async def shell_exec(command: str) -> str:
+async def shell_exec(command: str, ctx: Context = None) -> str:
     """
     Shell命令执行接口 (异步非阻塞)。实时将输出打印到终端。
     禁止执行mcp服务中已提供的工具，如dirsearch等
     :param command: 要执行的shell命令（如"ls -al"）
     :return: 命令输出结果
     """
+    validator = _get_validator_from_context(ctx)
+    if validator and validator.scope.disable_shell_exec:
+        return json.dumps({"success": False, "error": "shell_exec 已被边界策略禁用", "rule": "disable_shell_exec"})
     output_lines = []
     try:
         process = await asyncio.create_subprocess_shell(
@@ -646,7 +662,7 @@ async def shell_exec(command: str) -> str:
 _python_exec_lock = asyncio.Lock()
 
 @mcp.tool()
-async def python_exec(script: str) -> str:
+async def python_exec(script: str, ctx: Context = None) -> str:
     """
     Python脚本执行接口 (异步非阻塞).
     此工具现在运行在独立线程中，不会阻塞主服务，允许你在运行长时间计算时保持系统响应。
@@ -655,6 +671,9 @@ async def python_exec(script: str) -> str:
     :param script: 要执行的Python代码字符串。确保代码是自包含的，并通过 `print()` 输出结果。
     :return: 执行输出结果
     """
+    validator = _get_validator_from_context(ctx)
+    if validator and validator.scope.disable_python_exec:
+        return json.dumps({"success": False, "error": "python_exec 已被边界策略禁用", "rule": "disable_python_exec"})
     import io
 
     # 定义同步执行函数
@@ -999,6 +1018,16 @@ def _coerce_bool(value, default=False):
 
     return default
 
+
+def _get_validator_from_context(ctx) -> Optional[BoundaryValidator]:
+    """从 MCP 上下文获取边界校验器，如果未配置则返回 None"""
+    if ctx is None:
+        return None
+    scope_data = getattr(ctx, 'request_context', {}).get('scope_config', None)
+    if scope_data:
+        return BoundaryValidator(ScopeConfig(**scope_data))
+    return None
+
 @mcp.tool()
 async def http_request(
     url: str,
@@ -1008,6 +1037,7 @@ async def http_request(
     timeout: int = 10,
     allow_redirects: bool | str | int | None = True,
     raw_mode: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     (首选)专业且健壮的HTTP请求工具，用于网络探测和安全测试。
@@ -1113,6 +1143,17 @@ async def http_request(
                         encoding_mode = "form_urlencoded_string"
 
         request_params["headers"] = request_headers
+
+        # 二次边界校验
+        validator = _get_validator_from_context(ctx)
+        if validator:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            result = validator.validate_target(host, port)
+            if not result.allowed:
+                return json.dumps({"success": False, "error": f"边界拦截: {result.reason}", "rule": result.rule_name})
 
         # 发送请求
         response = await _httpx_client.request(**request_params)

@@ -12,6 +12,11 @@ import httpx
 from rich.errors import MarkupError
 from rich.panel import Panel
 
+
+class BoundaryBlockedError(Exception):
+    """Raised when a tool call is blocked by boundary validation."""
+    pass
+
 from core.console import sanitize_for_rich
 
 
@@ -24,6 +29,7 @@ from core.graph_manager import GraphManager
 from core.prompts import PromptManager
 from llm.llm_client import LLMClient
 from tools.mcp_client import call_mcp_tool_async
+from core.boundary import BoundaryValidator, BoundaryCheckResult
 from conf.config import (
     EXECUTOR_MAX_STEPS,
     EXECUTOR_MESSAGE_COMPRESS_THRESHOLD,
@@ -497,6 +503,7 @@ async def run_executor_cycle(
     output_mode: str = "default",
     max_steps: int = None,
     disable_artifact_check: bool = False,
+    validator: BoundaryValidator = None,
 ) -> tuple[str, str, dict]:
     """
     执行器循环：为子任务执行思想树探索循环。
@@ -711,6 +718,7 @@ async def run_executor_cycle(
         potential_parent = last_step_ids[0] if last_step_ids else subtask_id
         current_cycle_step_ids = []
 
+        # BoundaryBlockedError defined as module-level; reuse to avoid redefining each cycle
         for i, op in enumerate(current_step_ops):
             step_id = op.get("node_id")
             if not step_id or step_id == "None":
@@ -766,6 +774,26 @@ async def run_executor_cycle(
                 )
             )
             
+            if validator:
+                boundary_result = validator.validate_tool_call(tool_name, tool_params)
+                if not boundary_result.allowed:
+                    error_msg = f"边界拦截: {boundary_result.reason} (规则: {boundary_result.rule_name})"
+                    _get_console().print(Panel(error_msg, title="边界拦截", style="bold red"))
+
+                    async def _blocked(msg):
+                        raise BoundaryBlockedError(msg)
+
+                    execution_tasks.append(_blocked(error_msg))
+                    try:
+                        await broker.emit(
+                            "boundary.blocked",
+                            {"tool": tool_name, "reason": boundary_result.reason, "rule": boundary_result.rule_name, "params": tool_params},
+                            op_id=os.path.basename(log_dir) if log_dir else None,
+                        )
+                    except Exception:
+                        pass
+                    continue
+
             execution_tasks.append(
                 asyncio.wait_for(
                     _handle_local_tool(tool_name, tool_params, graph_manager)
@@ -814,7 +842,10 @@ async def run_executor_cycle(
                 step_status = "completed"
                 
                 # Handle errors
-                if isinstance(result, Exception):
+                if isinstance(result, BoundaryBlockedError):
+                    result_str = str(result)
+                    step_status = "failed"
+                elif isinstance(result, Exception):
                     result_str = f"Error executing tool: {result}"
                     step_status = "failed"
                     if console_output_path:
