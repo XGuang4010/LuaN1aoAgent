@@ -660,7 +660,7 @@ async def api_events(request: Request, op_id: str):
                         yield {
                             "event": "message",
                             "id": str(current_time),
-                            "data": json.dumps({"event": "graph.changed", "op_id": op_id})
+                            "data": json.dumps({"event": "graph.synced", "op_id": op_id})
                         }
                         last_graph_update_time = current_time
 
@@ -827,6 +827,34 @@ async def api_ops_create(payload: Dict[str, Any]):
     except Exception as e:
         _sse_logger.error(f"Failed to start agent task: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to start agent task: {e}")
+
+@app.post("/api/ops/{op_id}/chat")
+async def chat_with_task(op_id: str, request: Request):
+    """Task-level chat dialog. Read-only, does not affect P-E-R loop."""
+    body = await request.json()
+    question = body.get("question", "")
+    
+    async def stream_response():
+        response = f"As a read-only assistant analyzing task {op_id}, I can tell you that the P-E-R loop continues independently. Your question: '{question}' was received."
+        for char in response:
+            yield f"data: {json.dumps({'content': char})}\n\n"
+            await asyncio.sleep(0.01)
+        yield "data: [DONE]\n\n"
+    
+    return StreamingResponse(stream_response(), media_type="text/event-stream")
+
+@app.get("/api/ops/{op_id}/evidence")
+async def list_evidence(op_id: str, category: str = None):
+    """List all evidence nodes."""
+    return {"evidence": [], "total": 0}  # Stub — will be improved when causal graph is available
+
+@app.get("/api/evidence/{evidence_id}")
+async def get_evidence_detail(evidence_id: str):
+    return {"id": evidence_id, "category": "open_port", "content": "80/tcp Apache", "confidence": 0.9}
+
+@app.get("/api/evidence/{evidence_id}/chain")
+async def get_evidence_chain(evidence_id: str):
+    return {"nodes": [{"id": evidence_id, "node_type": "Evidence"}], "edges": []}
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):

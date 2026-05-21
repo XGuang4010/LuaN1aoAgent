@@ -1871,9 +1871,7 @@ function updateLegend() {
 
 function showDetails(d) {
   const c = document.getElementById('node-detail-content');
-  let h = '';
-
-  // Header with Type and ID - 增强类型显示
+  state._detailData = d;
   const typeLabel = d.type === 'root' ? t('type.root') :
     d.type === 'task' ? t('type.task') :
       d.type === 'action' ? t('type.action') :
@@ -1882,71 +1880,434 @@ function showDetails(d) {
     d.type === 'task' ? '#8b5cf6' :
       d.type === 'action' ? '#f59e0b' :
         '#64748b';
-
-  h += `<div style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border-color)">
-          <div style="font-size:10px;text-transform:uppercase;color:${typeColor};font-weight:bold;display:inline-block;background:${typeColor}22;padding:2px 6px;border-radius:3px;">${typeLabel}</div>
-          <div style="font-size:14px;font-weight:bold;word-break:break-all;margin-top:6px;">${d.label || d.description || d.id}</div>
-          <div style="font-size:10px;color:var(--text-muted);margin-top:4px">ID: ${d.id}</div>
-        </div>`;
-
-  // Status Badge
   const statusColor = nodeColors[d.status] || '#64748b';
   const statusText = d.status ? t('status.' + d.status) || d.status : 'UNKNOWN';
-  h += `<div style="margin-bottom:16px"><span style="background:${statusColor};color:white;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:bold;text-transform:uppercase">${statusText}</span></div>`;
 
-  // Tool Execution Details (if available) - 增强显示
-  if (d.tool_name || d.action) {
-    h += `<div class="detail-section" style="border:1px solid #f59e0b;border-radius:6px;padding:12px;margin-bottom:12px;background:rgba(245,158,11,0.05);">
-              <div class="detail-header" style="color:#f59e0b;margin-bottom:8px;">🔧 ${t('panel.tool')}</div>`;
+  let h = '';
+  // Header
+  h += `<div class="detail-header-bar">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+      <div>
+        <span class="detail-type-badge" style="background:${typeColor}22;color:${typeColor};border:1px solid ${typeColor}44;">${typeLabel}</span>
+        <span class="detail-status-badge" style="background:${statusColor}">${statusText}</span>
+      </div>
+      <div style="display:flex;gap:4px;">
+        <button class="btn btn-chat" onclick="openChatDialog('${d.id}')" title="Chat" style="font-size:11px;padding:2px 8px;">💬</button>
+      </div>
+    </div>
+    <div style="font-size:13px;font-weight:bold;word-break:break-word;margin-top:6px;">${d.label || d.description || d.id}</div>
+    <div style="font-size:10px;color:var(--text-muted);margin-top:2px;word-break:break-all;">ID: ${d.id}</div>
+  </div>`;
 
-    const toolName = d.tool_name || (d.action && d.action.tool);
-    if (toolName) {
-      h += `<div class="detail-row" style="margin-bottom:8px;">
-                  <span class="detail-key">${t('panel.tool')}:</span> 
-                  <span class="detail-val" style="color:#f59e0b;font-weight:bold;font-family:monospace;">${toolName}</span>
-                </div>`;
-    }
-
-    const toolArgs = d.tool_args || (d.action && d.action.params);
-    if (toolArgs) {
-      h += `<div class="detail-row" style="margin-bottom:4px;">
-                  <span class="detail-key">${t('panel.args')}:</span>
-                </div>
-                <div class="code-block" style="max-height:200px;overflow-y:auto;margin-bottom:8px;">${hlJson(toolArgs)}</div>`;
-    }
-
-    if (d.result) {
-      h += `<div class="detail-row" style="margin-bottom:4px;">
-                  <span class="detail-key">${t('panel.result')}:</span>
-                </div>
-                <div class="code-block" style="max-height:300px;overflow-y:auto;">${hlJson(d.result)}</div>`;
-    }
-
-    if (d.observation) {
-      h += `<div class="detail-row" style="margin-bottom:4px;margin-top:8px;">
-                  <span class="detail-key">${t('panel.observation')}:</span>
-                </div>
-                <div class="code-block" style="max-height:300px;overflow-y:auto;">${hlJson(d.observation)}</div>`;
-    }
-
-    h += `</div>`;
-  }
-
-  // Other Properties
-  h += `<div class="detail-section"><div class="detail-header">${t('panel.description')}</div><table class="detail-table">`;
-  Object.entries(d).forEach(([k, v]) => {
-    if (!['x', 'y', 'fx', 'fy', 'vx', 'vy', 'index', 'children', 'width', 'height', 'tool_name', 'tool_args', 'result', 'observation', 'action', 'label', 'id', 'type', 'status', 'description', 'original_type'].includes(k)) {
-      h += `<tr><td class="detail-key">${escapeHtml(k)}</td><td class="detail-val">${typeof v === 'object' ? hlJson(v) : escapeHtml(String(v))}</td></tr>`;
-    }
+  // Tab bar
+  const tabs = [
+    { id: 'overview', label: t('tab.overview') || '概览' },
+    { id: 'findings', label: t('tab.findings') || '发现' },
+    { id: 'evidence', label: t('tab.evidence') || '证据' },
+    { id: 'raw', label: t('tab.raw') || '原始输出' },
+    { id: 'suggestions', label: t('tab.suggestions') || '建议' },
+  ];
+  h += `<div class="tab-bar">`;
+  tabs.forEach((tab, i) => {
+    h += `<button class="tab-btn ${i === 0 ? 'active' : ''}" onclick="switchDetailTab('${tab.id}', this)">${escapeHtml(tab.label)}</button>`;
   });
-  h += '</table></div>';
+  h += `</div>`;
+
+  // Tab panes
+  h += `<div class="tab-pane active" id="tab-overview">${renderOverviewTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-findings">${renderFindingsTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-evidence">${renderEvidenceTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-raw">${renderRawTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-suggestions">${renderSuggestionsTab(d)}</div>`;
 
   c.innerHTML = h;
   document.getElementById('node-details-panel').classList.add('show');
 }
 
+function switchDetailTab(tabName, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const pane = document.getElementById('tab-' + tabName);
+  if (pane) pane.classList.add('active');
+}
+
+function renderOverviewTab(d) {
+  let h = '';
+  // Summary from observation
+  if (d.observation) {
+    h += `<div class="detail-section"><div class="section-title">${t('panel.observation') || '执行摘要'}</div>`;
+    if (typeof d.observation === 'object') {
+      h += `<div class="code-block">${hlJson(d.observation)}</div>`;
+    } else {
+      h += `<div style="font-size:12px;color:var(--text-main);line-height:1.6;">${escapeHtml(d.observation)}</div>`;
+    }
+    h += `</div>`;
+  }
+  // Tool info
+  if (d.tool_name || (d.action && d.action.tool)) {
+    const toolName = d.tool_name || d.action.tool;
+    h += `<div class="detail-section"><div class="section-title">🔧 ${t('panel.tool') || '工具'}</div>`;
+    h += `<div style="font-size:12px;color:#f59e0b;font-weight:bold;font-family:monospace;">${escapeHtml(toolName)}</div>`;
+    const toolArgs = d.tool_args || (d.action && d.action.params);
+    if (toolArgs) {
+      h += `<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">参数:</div><div class="code-block" style="max-height:150px;">${hlJson(toolArgs)}</div>`;
+    }
+    h += `</div>`;
+  }
+  // Description
+  if (d.description) {
+    h += `<div class="detail-section"><div class="section-title">${t('panel.description') || '描述'}</div>`;
+    h += `<div style="font-size:12px;color:var(--text-main);">${escapeHtml(d.description)}</div></div>`;
+  }
+  // Goal
+  if (d.goal) {
+    h += `<div class="detail-section"><div class="section-title">目标</div>`;
+    h += `<div style="font-size:12px;color:var(--text-main);">${escapeHtml(d.goal)}</div></div>`;
+  }
+  if (!h) h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无概览信息</div>`;
+  return h;
+}
+
+function renderFindingsTab(d) {
+  const findings = d.findings || (d.data && d.data.findings) || [];
+  if (!findings || (Array.isArray(findings) && findings.length === 0)) {
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无发现数据</div>`;
+  }
+  // Group by category
+  const groups = {};
+  (Array.isArray(findings) ? findings : Object.values(findings)).forEach(f => {
+    const cat = (f.category || f.type || 'other').toLowerCase();
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(f);
+  });
+  let h = '';
+  Object.entries(groups).forEach(([cat, items]) => {
+    const catLabel = cat.replace(/_/g, ' ');
+    h += `<div class="finding-group"><div class="finding-group-title">${escapeHtml(catLabel)} (${items.length})</div>`;
+    items.forEach(item => {
+      const title = item.title || item.description || item.content || JSON.stringify(item).slice(0, 80);
+      const sev = (item.severity || item.level || '').toLowerCase();
+      const sevColors = { critical: '#ef4444', high: '#f59e0b', medium: '#eab308', low: '#84cc16', info: '#3b82f6' };
+      const sevColor = sevColors[sev] || '#64748b';
+      h += `<div class="finding-item">
+        <div class="finding-item-header">
+          <span style="color:var(--text-main);font-weight:500;font-size:12px;">${escapeHtml(String(title).slice(0, 100))}</span>
+          <span class="ev-cat-tag" style="background:${sevColor}22;color:${sevColor};border-color:${sevColor}44;">${escapeHtml(sev || 'info')}</span>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(String(item.detail || item.evidence || '').slice(0, 200))}</div>
+      </div>`;
+      if (item.confidence !== undefined) {
+        h += `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">置信度: ${(item.confidence * 100).toFixed(0)}%</div>`;
+      }
+    });
+    h += `</div>`;
+  });
+  return h;
+}
+
+function renderEvidenceTab(d) {
+  const evIds = d.evidence_ids || (d.data && d.data.evidence_ids) || [];
+  if (!evIds || (Array.isArray(evIds) && evIds.length === 0)) {
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无证据关联</div>`;
+  }
+  let h = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">关联证据 (${evIds.length})</div>`;
+  (Array.isArray(evIds) ? evIds : Object.keys(evIds)).forEach(id => {
+    h += `<div class="finding-item" style="cursor:pointer;" onclick="showEvidenceDetail('${escapeHtml(id)}')">
+      <div class="finding-item-header">
+        <span style="font-family:monospace;font-size:11px;">${escapeHtml(id)}</span>
+        <span style="font-size:10px;color:var(--accent-primary);">查看 →</span>
+      </div>
+    </div>`;
+  });
+  return h;
+}
+
+function renderRawTab(d) {
+  const raw = d.observation || (d.data && d.data.raw_output) || d.result;
+  if (!raw) {
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无原始输出</div>`;
+  }
+  let content = (typeof raw === 'object') ? JSON.stringify(raw, null, 2) : String(raw);
+  // Truncate if too long
+  const MAX_RAW_LEN = 50000;
+  if (content.length > MAX_RAW_LEN) {
+    content = content.slice(0, MAX_RAW_LEN) + '\n\n... (output truncated, ' + content.length + ' bytes total)';
+  }
+  return `<div class="code-block" style="max-height:400px;overflow-y:auto;white-space:pre-wrap;font-size:11px;">${hlJson(content)}</div>`;
+}
+
+function renderSuggestionsTab(d) {
+  const findings = d.findings || (d.data && d.data.findings) || [];
+  const categories = new Set();
+  (Array.isArray(findings) ? findings : Object.values(findings)).forEach(f => {
+    const cat = (f.category || f.type || '').toLowerCase();
+    if (cat) categories.add(cat);
+  });
+  let h = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">基于当前发现，建议下一步：</div>';
+  if (categories.size === 0) {
+    h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无足够数据生成建议</div>`;
+    return h;
+  }
+  const suggestionMap = {
+    'open_port': ['对开放端口进行 banner 抓取', '使用 nmap 进行服务版本探测', '检查常见弱口令服务'],
+    'service': ['根据服务版本搜索已知漏洞 (searchsploit)', '尝试使用该服务的默认凭据', '测试服务配置安全性'],
+    'subdomain': ['对发现的子域名进行 HTTP 探测', '对子域名进行端口扫描', '收集子域名的 DNS 记录'],
+    'vuln': ['确认漏洞是否真实可被利用', '尝试搜索公开的漏洞利用代码', '分析漏洞影响范围'],
+    'url': ['对 URL 进行目录扫描 (dirsearch)', '测试常见 Web 漏洞 (SQLi/XSS/SSRF)', '分析页面 JavaScript 和 API 端点'],
+    'http_header': ['检查安全头缺失导致的潜在风险', '分析 CORS 配置安全性', '检查 Cookie 安全属性设置'],
+    'technology': ['根据技术栈搜索已知漏洞', '检查组件版本是否过时', '寻找版本相关的 CVE'],
+    'cms': ['尝试 CMS 指纹识别', '检查 CMS 版本漏洞', '寻找 CMS 后台路径'],
+    'email': ['验证邮箱有效性', '检查邮件服务器配置', '测试邮件注入或 SPF 记录'],
+    'dns': ['检查域名的 DNS 记录', '测试区域传输漏洞', '寻找子域名劫持机会'],
+  };
+  categories.forEach(cat => {
+    const suggestions = suggestionMap[cat] || ['根据发现信息进行深入分析', '搜索相关已知漏洞', '尝试扩大攻击面'];
+    h += `<div class="finding-group"><div class="finding-group-title">💡 ${escapeHtml(cat.replace(/_/g, ' '))}</div>`;
+    suggestions.forEach(s => {
+      h += `<div class="suggestion-item">• ${escapeHtml(s)}</div>`;
+    });
+    h += `</div>`;
+  });
+  return h;
+}
+
 function closeDetails() {
   document.getElementById('node-details-panel').classList.remove('show');
+}
+
+// ===== Chat Dialog Functions =====
+
+function openChatDialog(nodeId) {
+  let dialog = document.getElementById('chat-dialog');
+  if (!dialog) {
+    dialog = document.createElement('div');
+    dialog.id = 'chat-dialog';
+    dialog.className = 'chat-dialog';
+    dialog.innerHTML = `<div class="chat-header">
+      <span id="chat-title">Chat</span>
+      <button class="chat-close-btn" onclick="closeChatDialog()">✕</button>
+    </div>
+    <div class="chat-messages" id="chat-messages">
+      <div class="chat-msg system-msg">您好！我是只读助手，可以回答关于此任务的任何问题。</div>
+    </div>
+    <div class="chat-quick-qs">
+      <button class="chat-q-btn" onclick="askChat('当前进度？')">当前进度？</button>
+      <button class="chat-q-btn" onclick="askChat('关键发现？')">关键发现？</button>
+      <button class="chat-q-btn" onclick="askChat('下一步？')">下一步？</button>
+    </div>
+    <div class="chat-input-area">
+      <input type="text" id="chat-input" placeholder="输入问题..." onkeydown="if(event.key==='Enter')askChat(this.value)">
+      <button class="chat-send-btn" onclick="askChat(document.getElementById('chat-input').value)">发送</button>
+    </div>`;
+    document.body.appendChild(dialog);
+  }
+  dialog.style.display = 'flex';
+  document.getElementById('chat-title').textContent = `Chat: ${nodeId}`;
+  state._chatNodeId = nodeId;
+}
+
+function closeChatDialog() {
+  const dialog = document.getElementById('chat-dialog');
+  if (dialog) dialog.style.display = 'none';
+}
+
+async function askChat(question) {
+  if (!question || !question.trim()) return;
+  const msgArea = document.getElementById('chat-messages');
+  const input = document.getElementById('chat-input');
+  const q = question.trim();
+  input.value = '';
+
+  // User message
+  const userMsg = document.createElement('div');
+  userMsg.className = 'chat-msg user-msg';
+  userMsg.textContent = q;
+  msgArea.appendChild(userMsg);
+  msgArea.scrollTop = msgArea.scrollHeight;
+
+  // Assistant message (streaming)
+  const assistMsg = document.createElement('div');
+  assistMsg.className = 'chat-msg assist-msg';
+  assistMsg.textContent = '';
+  msgArea.appendChild(assistMsg);
+
+  try {
+    const resp = await fetch(`/api/ops/${state.op_id}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q })
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const payload = line.slice(6).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(payload);
+            if (parsed.content) {
+              assistMsg.textContent += parsed.content;
+              msgArea.scrollTop = msgArea.scrollHeight;
+            }
+          } catch (e) { /* skip partial lines */ }
+        }
+      }
+    }
+  } catch (e) {
+    assistMsg.textContent = 'Error: ' + e.message;
+  }
+}
+
+// ===== Evidence View Functions =====
+
+function openEvidenceView() {
+  const main = document.getElementById('main');
+  let evView = document.getElementById('evidence-view');
+  if (!evView) {
+    evView = document.createElement('div');
+    evView.id = 'evidence-view';
+    evView.innerHTML = `<div class="ev-toolbar">
+      <span class="ev-title">证据浏览器</span>
+      <button class="btn" onclick="closeEvidenceView()" style="font-size:12px;">✕ 关闭</button>
+    </div>
+    <div class="ev-body">
+      <div class="ev-filter">
+        <input type="text" id="ev-search" placeholder="搜索证据..." oninput="applyEvidenceFilter()">
+        <select id="ev-cat-filter" onchange="applyEvidenceFilter()">
+          <option value="">全部类别</option>
+          <option value="open_port">开放端口</option>
+          <option value="service">服务</option>
+          <option value="subdomain">子域名</option>
+          <option value="vuln">漏洞</option>
+          <option value="url">URL</option>
+          <option value="http_header">HTTP头</option>
+        </select>
+      </div>
+      <div class="ev-list" id="ev-list">
+        <div style="text-align:center;color:var(--text-muted);padding:40px;">加载中...</div>
+      </div>
+      <div class="ev-detail" id="ev-detail">
+        <div style="text-align:center;color:var(--text-muted);padding:40px;">选择一个证据查看详情</div>
+      </div>
+    </div>`;
+    main.appendChild(evView);
+  }
+  evView.style.display = 'flex';
+  loadEvidence();
+}
+
+function closeEvidenceView() {
+  const evView = document.getElementById('evidence-view');
+  if (evView) evView.style.display = 'none';
+}
+
+async function loadEvidence() {
+  const list = document.getElementById('ev-list');
+  list.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">加载中...</div>';
+  try {
+    const data = await fetch(`/api/ops/${state.op_id}/evidence?op_id=${state.op_id}`).then(r => r.json());
+    state._allEvidence = data.evidence || [];
+    renderEvidenceList(state._allEvidence);
+  } catch (e) {
+    list.innerHTML = '<div style="text-align:center;color:#ef4444;padding:40px;">加载失败</div>';
+  }
+}
+
+function applyEvidenceFilter() {
+  const search = (document.getElementById('ev-search').value || '').toLowerCase();
+  const cat = document.getElementById('ev-cat-filter').value;
+  let filtered = state._allEvidence || [];
+  if (search) {
+    filtered = filtered.filter(e => JSON.stringify(e).toLowerCase().includes(search));
+  }
+  if (cat) {
+    filtered = filtered.filter(e => (e.category || e.type || '').toLowerCase() === cat.toLowerCase());
+  }
+  renderEvidenceList(filtered);
+}
+
+function renderEvidenceList(items) {
+  const list = document.getElementById('ev-list');
+  if (!items || items.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">暂无证据</div>';
+    return;
+  }
+  let h = '';
+  const catColors = {
+    open_port: '#3b82f6', service: '#8b5cf6', subdomain: '#06b6d4',
+    vuln: '#ef4444', url: '#84cc16', http_header: '#f59e0b'
+  };
+  items.forEach(e => {
+    const cat = e.category || e.type || 'other';
+    const color = catColors[cat] || '#64748b';
+    h += `<div class="ev-list-item" onclick="showEvidenceDetail('${escapeHtml(e.id || '')}')">
+      <div class="ev-list-item-header">
+        <span class="ev-cat-tag" style="background:${color}22;color:${color};border:1px solid ${color}44;">${escapeHtml(cat)}</span>
+        <span style="font-size:11px;font-weight:500;color:var(--text-main);">${escapeHtml(e.title || e.content || e.id || 'Unknown')}</span>
+      </div>
+      <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">
+        ${escapeHtml(String(e.content || e.description || '').slice(0, 120))}
+        ${e.confidence !== undefined ? ` | 置信度: ${(e.confidence * 100).toFixed(0)}%` : ''}
+      </div>
+    </div>`;
+  });
+  list.innerHTML = h;
+}
+
+async function showEvidenceDetail(evidenceId) {
+  if (!evidenceId) return;
+  const detail = document.getElementById('ev-detail');
+  detail.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">加载中...</div>';
+  try {
+    const [evData, chainData] = await Promise.all([
+      fetch(`/api/evidence/${evidenceId}`).then(r => r.json()),
+      fetch(`/api/evidence/${evidenceId}/chain`).then(r => r.json())
+    ]);
+    let h = '';
+    // Evidence info
+    h += `<div class="ev-detail-section">
+      <div style="font-weight:600;margin-bottom:8px;">${escapeHtml(evData.id || evidenceId)}</div>
+      <div style="font-size:12px;color:var(--text-main);margin-bottom:4px;">类别: ${escapeHtml(evData.category || 'unknown')}</div>
+      <div style="font-size:12px;color:var(--text-main);margin-bottom:4px;">内容: ${escapeHtml(String(evData.content || ''))}</div>
+      ${evData.confidence !== undefined ? `<div style="font-size:12px;color:var(--text-main);">置信度: ${(evData.confidence * 100).toFixed(0)}%</div>` : ''}
+    </div>`;
+    // Causal chain
+    if (chainData.nodes && chainData.nodes.length > 0) {
+      h += `<div class="ev-detail-section"><div style="font-weight:600;margin-bottom:8px;">因果链</div>
+      <div class="causal-chain">`;
+      chainData.nodes.forEach((n, i) => {
+        const colors = { Evidence: '#06b6d4', Hypothesis: '#84cc16', Vulnerability: '#a855f7', ConfirmedVulnerability: '#f59e0b', Flag: '#ef4444', KeyFact: '#fbbf24' };
+        const c = colors[n.node_type] || '#64748b';
+        h += `<div class="causal-chain-node" style="border-color:${c};">
+          <span class="ev-cat-tag" style="background:${c}22;color:${c};">${escapeHtml(n.node_type || 'node')}</span>
+          <span style="font-size:11px;">${escapeHtml(n.label || n.id || '')}</span>
+        </div>`;
+        if (i < chainData.nodes.length - 1) {
+          h += `<div class="causal-chain-arrow">↓</div>`;
+        }
+      });
+      h += `</div></div>`;
+    }
+    if (chainData.edges && chainData.edges.length > 0) {
+      h += `<div class="ev-detail-section"><div style="font-weight:600;margin-bottom:8px;">关系 (${chainData.edges.length})</div>`;
+      chainData.edges.forEach(e => {
+        h += `<div style="font-size:11px;color:var(--text-muted);margin-bottom:2px;">${escapeHtml(e.source || '')} → ${escapeHtml(e.target || '')} <span style="color:#64748b;">[${escapeHtml(e.label || e.type || 'related')}]</span></div>`;
+      });
+      h += `</div>`;
+    }
+    detail.innerHTML = h;
+  } catch (e) {
+    detail.innerHTML = `<div style="text-align:center;color:#ef4444;padding:40px;">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // 初始化节点详情窗口拖动功能
@@ -2012,12 +2373,12 @@ function subscribe() {
       const eventType = msg.event || 'message';
 
       // 对于已完成的任务，跳过图形刷新事件（减少不必要的渲染）
-      if (eventType === 'graph.changed' || eventType === 'execution.step.completed') {
+      if (eventType === 'graph.changed' || eventType === 'graph.synced' || eventType === 'execution.step.completed') {
         if (!state.missionAccomplished) {
           render();
         }
       }
-      if (eventType === 'ping' || eventType === 'graph.ready') return;
+      if (eventType === 'ping' || eventType === 'graph.ready' || eventType === 'graph.synced') return;
 
       // 分流渲染（实时事件）
       if (eventType.startsWith('llm.')) {
