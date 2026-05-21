@@ -2321,9 +2321,85 @@ function openCreateTaskModal() {
   document.getElementById('create-llm-reflector').value = '';
   document.getElementById('advanced-content').style.display = 'none';
   document.getElementById('advanced-arrow').style.transform = 'rotate(0deg)';
+  document.getElementById('scope-content').style.display = 'none';
+  document.getElementById('scope-arrow').style.transform = 'rotate(0deg)';
+  resetScopeForm();
+  state.scopePanelOpened = false;
   updateHitlLabel();
   // 聚焦到目标输入框
   setTimeout(() => document.getElementById('create-goal').focus(), 100);
+}
+
+// 重置 Scope 表单
+function resetScopeForm() {
+  document.getElementById('scope-allowed-targets').value = '';
+  document.getElementById('scope-blocked-targets').value = '';
+  document.getElementById('scope-allowed-ports').value = '';
+  document.getElementById('scope-disabled-tools').value = '';
+  document.getElementById('scope-max-response-size').value = '';
+  document.getElementById('scope-rate-limit').value = '';
+  document.getElementById('scope-disable-shell').checked = false;
+  document.getElementById('scope-disable-python').checked = false;
+  document.getElementById('scope-block-private').checked = false;
+}
+
+// 切换 Scope 配置展开/折叠
+function toggleScopeConfig() {
+  const content = document.getElementById('scope-content');
+  const arrow = document.getElementById('scope-arrow');
+  if (content.style.display === 'none') {
+    content.style.display = 'block';
+    arrow.style.transform = 'rotate(180deg)';
+    state.scopePanelOpened = true;
+  } else {
+    content.style.display = 'none';
+    arrow.style.transform = 'rotate(0deg)';
+  }
+}
+
+// 加载默认 Scope 配置
+async function loadScopeDefaults() {
+  try {
+    const data = await fetch('/api/scope-defaults').then(r => r.json());
+    const defaults = data.defaults || {};
+    document.getElementById('scope-allowed-targets').value = (defaults.allowed_targets || []).join(', ');
+    document.getElementById('scope-blocked-targets').value = (defaults.blocked_targets || []).join(', ');
+    document.getElementById('scope-allowed-ports').value = (defaults.allowed_ports || []).join(', ');
+    document.getElementById('scope-disabled-tools').value = (defaults.disabled_tools || []).join(', ');
+    document.getElementById('scope-max-response-size').value = defaults.max_response_size || '';
+    document.getElementById('scope-rate-limit').value = defaults.rate_limit_requests_per_sec || '';
+    document.getElementById('scope-disable-shell').checked = !!defaults.disable_shell_exec;
+    document.getElementById('scope-disable-python').checked = !!defaults.disable_python_exec;
+    document.getElementById('scope-block-private').checked = !!defaults.block_private_network;
+    state.scopePanelOpened = true;
+  } catch (e) {
+    console.error('Failed to load scope defaults:', e);
+    alert(currentLang === 'zh' ? '加载默认值失败' : 'Failed to load defaults');
+  }
+}
+
+// 从表单收集 Scope 配置
+function collectScopeConfig() {
+  const parseList = (val) => val.split(',').map(s => s.trim()).filter(Boolean);
+  const config = {};
+  const allowedTargets = document.getElementById('scope-allowed-targets').value.trim();
+  const blockedTargets = document.getElementById('scope-blocked-targets').value.trim();
+  const allowedPorts = document.getElementById('scope-allowed-ports').value.trim();
+  const disabledTools = document.getElementById('scope-disabled-tools').value.trim();
+  const maxResponseSize = document.getElementById('scope-max-response-size').value.trim();
+  const rateLimit = document.getElementById('scope-rate-limit').value.trim();
+
+  if (allowedTargets) config.allowed_targets = parseList(allowedTargets);
+  if (blockedTargets) config.blocked_targets = parseList(blockedTargets);
+  if (allowedPorts) config.allowed_ports = parseList(allowedPorts).map(Number);
+  if (disabledTools) config.disabled_tools = parseList(disabledTools);
+  if (maxResponseSize) config.max_response_size = Number(maxResponseSize);
+  if (rateLimit) config.rate_limit_requests_per_sec = Number(rateLimit);
+  config.disable_shell_exec = document.getElementById('scope-disable-shell').checked;
+  config.disable_python_exec = document.getElementById('scope-disable-python').checked;
+  config.block_private_network = document.getElementById('scope-block-private').checked;
+
+  return config;
 }
 
 // 切换高级配置展开/折叠
@@ -2391,6 +2467,20 @@ async function submitCreateTask() {
   try {
     const r = await api('/api/ops', payload);
     if (r.ok) {
+      // 保存 Scope 配置（仅当用户打开了 Scope 面板时）
+      if (state.scopePanelOpened) {
+        const scopeConfig = collectScopeConfig();
+        try {
+          await fetch(`/api/ops/${r.op_id}/scope`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope_config: scopeConfig })
+          });
+        } catch (scopeErr) {
+          console.error('Failed to save scope config:', scopeErr);
+        }
+      }
+
       closeModals();
       // 等待任务列表刷新完成
       await loadOps();

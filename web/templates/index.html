@@ -303,6 +303,74 @@
             </div>
           </div>
         </div>
+
+        <!-- Scope 边界配置（折叠） -->
+        <div class="advanced-config" style="margin-top:12px;">
+          <div class="advanced-header" onclick="toggleScopeConfig()">
+            <span>Scope 边界配置</span>
+            <svg id="scope-arrow" width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              style="transition:transform 0.2s;">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+            </svg>
+          </div>
+          <div id="scope-content" style="display:none;margin-top:12px;">
+            <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+              <button class="btn" style="font-size:12px;padding:4px 12px;" onclick="loadScopeDefaults()">加载默认值</button>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">允许目标 (逗号分隔)</label>
+                <input id="scope-allowed-targets"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="*, example.com">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">阻止目标 (逗号分隔)</label>
+                <input id="scope-blocked-targets"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="10.0.0.0/8, 192.168.0.0/16">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">允许端口 (逗号分隔)</label>
+                <input id="scope-allowed-ports"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="80, 443, 8080">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">禁用工具 (逗号分隔)</label>
+                <input id="scope-disabled-tools"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="shell_exec, python_exec">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">最大响应大小 (字节)</label>
+                <input id="scope-max-response-size" type="number"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="50000">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">速率限制 (请求/秒)</label>
+                <input id="scope-rate-limit" type="number" step="0.1"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="10.0">
+              </div>
+            </div>
+            <div style="display:flex;gap:24px;margin-top:12px;">
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" id="scope-disable-shell" class="rounded">
+                <span>禁用 shell_exec</span>
+              </label>
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" id="scope-disable-python" class="rounded">
+                <span>禁用 python_exec</span>
+              </label>
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" id="scope-block-private" class="rounded">
+                <span>阻止私有网络</span>
+              </label>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="modal-footer"
         style="padding:16px 24px;background:var(--bg-sidebar);border-top:1px solid var(--border-color);">
@@ -324,7 +392,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260307v1"></script>
+  <script src="/static/app.js?v=20260521v1"></script>
 </body>
 
 </html>

@@ -23,7 +23,7 @@ import subprocess
 import time
 import logging
 import shlex
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from http.server import BaseHTTPRequestHandler
 import sys
 import os
@@ -63,12 +63,23 @@ except ImportError as e:
     FastMCP = None
     Server = None
 
+# 尝试导入 Context（用于工具上下文注入）
+Context = None
+try:
+    from mcp.server.fastmcp import Context
+except ImportError:
+    try:
+        from fastmcp import Context
+    except ImportError:
+        pass
+
 # 设置环境变量，抑制不必要的输出和警告
 os.environ.setdefault("FASTMCP_NO_BANNER", "1")
 os.environ.setdefault("FASTMCP_LOG_LEVEL", "WARNING")
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")  # 禁用 CUDA
 import warnings
 from tools.tool_env import resolve_project_tool
+from core.boundary import ScopeConfig, BoundaryValidator, BoundaryCheckResult
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -576,13 +587,16 @@ async def web_search(query: str, num_results: int = 5) -> str:
 
 
 @mcp.tool()
-async def shell_exec(command: str) -> str:
+async def shell_exec(command: str, ctx: Context = None) -> str:
     """
     Shell命令执行接口 (异步非阻塞)。实时将输出打印到终端。
     禁止执行mcp服务中已提供的工具，如dirsearch等
     :param command: 要执行的shell命令（如"ls -al"）
     :return: 命令输出结果
     """
+    validator = _get_validator_from_context(ctx)
+    if validator and validator.scope.disable_shell_exec:
+        return json.dumps({"success": False, "error": "shell_exec 已被边界策略禁用", "rule": "disable_shell_exec"})
     output_lines = []
     try:
         process = await asyncio.create_subprocess_shell(
@@ -648,7 +662,7 @@ async def shell_exec(command: str) -> str:
 _python_exec_lock = asyncio.Lock()
 
 @mcp.tool()
-async def python_exec(script: str) -> str:
+async def python_exec(script: str, ctx: Context = None) -> str:
     """
     Python脚本执行接口 (异步非阻塞).
     此工具现在运行在独立线程中，不会阻塞主服务，允许你在运行长时间计算时保持系统响应。
@@ -657,6 +671,9 @@ async def python_exec(script: str) -> str:
     :param script: 要执行的Python代码字符串。确保代码是自包含的，并通过 `print()` 输出结果。
     :return: 执行输出结果
     """
+    validator = _get_validator_from_context(ctx)
+    if validator and validator.scope.disable_python_exec:
+        return json.dumps({"success": False, "error": "python_exec 已被边界策略禁用", "rule": "disable_python_exec"})
     import io
 
     # 定义同步执行函数
@@ -1071,11 +1088,25 @@ def _classify_dirsearch_failure(output: str, return_code: int) -> Dict[str, Any]
 
     return {
         "success": False,
+        "status": "error",
         "output": output,
         "error_type": error_type,
         "message": f"Command returned non-zero exit status {return_code}.",
         "fix_suggestion": fix_suggestion,
     }
+
+
+def _extract_dirsearch_findings(output: str) -> List[str]:
+    """提取 dirsearch 输出中的命中行，供 LLM 快速理解扫描已完成。"""
+
+    findings = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("[") and " - " in stripped:
+            findings.append(stripped)
+    return findings
 
 
 @mcp.tool()
@@ -1092,6 +1123,7 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
         return json.dumps(
             {
                 "success": False,
+                "status": "error",
                 "output": "",
                 "error_type": "MISSING_TOOL",
                 "message": "dirsearch not configured.",
@@ -1125,7 +1157,19 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
             failure["warnings"] = warnings_list
             return json.dumps(failure, ensure_ascii=False)
 
-        return json.dumps({"success": True, "output": full_output, "error": "", "warnings": warnings_list})
+        findings = _extract_dirsearch_findings(full_output)
+        return json.dumps(
+            {
+                "success": True,
+                "status": "success",
+                "message": f"dirsearch scan completed with {len(findings)} matching responses.",
+                "output": full_output,
+                "error": "",
+                "warnings": warnings_list,
+                "findings": findings[:50],
+                "findings_count": len(findings),
+            }
+        )
 
     except FileNotFoundError:
         failure = _classify_dirsearch_failure(f"{executable} not found", return_code=127)
@@ -1137,6 +1181,7 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
         return json.dumps(
             {
                 "success": False,
+                "status": "error",
                 "output": "".join(output_lines) if output_lines else "",
                 "error_type": "RUNTIME",
                 "message": f"Dirsearch execution failed: {str(e)}",
@@ -1167,6 +1212,19 @@ def _coerce_bool(value, default=False):
 
     return default
 
+
+def _get_validator_from_context(ctx) -> Optional[BoundaryValidator]:
+    """从 MCP 上下文获取边界校验器，如果未配置则返回 None"""
+    # 从 ctx 的 request_context 或 meta 中查找 scope_config
+    # 如果找到则创建 BoundaryValidator，否则返回 None（不校验）
+    if ctx is None:
+        return None
+    scope_data = getattr(ctx, 'request_context', {}).get('scope_config', None)
+    if scope_data:
+        return BoundaryValidator(ScopeConfig(**scope_data))
+    return None
+
+
 @mcp.tool()
 async def http_request(
     url: str,
@@ -1176,6 +1234,7 @@ async def http_request(
     timeout: int = 10,
     allow_redirects: bool | str | int | None = True,
     raw_mode: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     (首选)专业且健壮的HTTP请求工具，用于网络探测和安全测试。
@@ -1281,6 +1340,17 @@ async def http_request(
                         encoding_mode = "form_urlencoded_string"
 
         request_params["headers"] = request_headers
+
+        # 二次边界校验
+        validator = _get_validator_from_context(ctx)
+        if validator:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            result = validator.validate_target(host, port)
+            if not result.allowed:
+                return json.dumps({"success": False, "error": f"边界拦截: {result.reason}", "rule": result.rule_name})
 
         # 发送请求
         response = await _httpx_client.request(**request_params)
@@ -2292,6 +2362,7 @@ async def nuclei_scan(
         result = await nuclei_scan("http://target.com", templates="cves/2023/CVE-2023-3452.yaml")
     """
     result = {
+        "success": True,
         "status": "success",
         "target": target,
         "findings": [],
@@ -2311,7 +2382,9 @@ async def nuclei_scan(
             os.path.join("nuclei", "nuclei.exe"),
         )
         if not nuclei_executable:
+            result["success"] = False
             result["status"] = "error"
+            result["error_type"] = "TOOL_MISSING"
             result["error"] = "nuclei not configured. Checked NUCLEI_PATH and TOOLS_HOME/nuclei/nuclei.exe from project .env only."
             return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -2350,7 +2423,9 @@ async def nuclei_scan(
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
+            result["success"] = False
             result["status"] = "timeout"
+            result["error_type"] = "TIMEOUT"
             result["error"] = f"Scan timed out after {timeout} seconds"
             result["message"] = "Consider using more specific templates, tags, or severity filters"
             return json.dumps(result, ensure_ascii=False, indent=2)
@@ -2394,12 +2469,17 @@ async def nuclei_scan(
         # 如果没有任何发现
         if not findings and stderr:
             result["stderr"] = stderr.decode('utf-8', errors='ignore')[:500]
+        result["message"] = f"nuclei scan completed with {len(findings)} findings."
         
     except FileNotFoundError:
+        result["success"] = False
         result["status"] = "error"
+        result["error_type"] = "TOOL_MISSING"
         result["error"] = "nuclei not installed. Install with: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
     except Exception as e:
+        result["success"] = False
         result["status"] = "error"
+        result["error_type"] = "RUNTIME"
         result["error"] = str(e)
     
     return json.dumps(result, ensure_ascii=False, indent=2)
@@ -2516,11 +2596,13 @@ async def subfinder_scan(
         JSON格式的扫描结果
     """
     result = {
+        "success": True,
         "status": "success",
         "domain": domain,
         "subdomains": [],
         "count": 0,
-        "raw_output": ""
+        "raw_output": "",
+        "message": ""
     }
     
     try:
@@ -2530,7 +2612,9 @@ async def subfinder_scan(
             os.path.join("subfinder", "subfinder.exe"),
         )
         if not subfinder_executable:
+            result["success"] = False
             result["status"] = "error"
+            result["error_type"] = "TOOL_MISSING"
             result["error"] = "subfinder not configured. Checked SUBFINDER_PATH and TOOLS_HOME/subfinder/subfinder.exe from project .env only."
             return json.dumps(result, ensure_ascii=False, indent=2)
 
@@ -2558,6 +2642,7 @@ async def subfinder_scan(
         subdomains = [line.strip() for line in stdout_str.split("\n") if line.strip()]
         result["subdomains"] = subdomains
         result["count"] = len(subdomains)
+        result["message"] = f"subfinder scan completed with {len(subdomains)} subdomains."
         
         # 如果提供了 domain_target_id，保存到数据库
         if domain_target_id:
@@ -2578,14 +2663,20 @@ async def subfinder_scan(
         if process.returncode != 0 and stderr_str:
             result["stderr"] = stderr_str
             if not subdomains:
+                result["success"] = False
                 result["status"] = "failed"
+                result["error_type"] = "RUNTIME"
         
     except FileNotFoundError:
+        result["success"] = False
         result["status"] = "error"
+        result["error_type"] = "TOOL_MISSING"
         result["error"] = "subfinder not found. Please install subfinder: https://github.com/projectdiscovery/subfinder"
     except Exception as e:
         logger.exception("subfinder_scan failed")
+        result["success"] = False
         result["status"] = "error"
+        result["error_type"] = "RUNTIME"
         result["error"] = str(e)
     
     return json.dumps(result, ensure_ascii=False, indent=2)

@@ -81,6 +81,7 @@ class SessionModel(Base):
     edges: Mapped[list["GraphEdgeModel"]] = relationship(back_populates="session", cascade="all, delete-orphan")
     logs: Mapped[list["EventLogModel"]] = relationship(back_populates="session", cascade="all, delete-orphan")
     interventions: Mapped[list["InterventionModel"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    scope_rules: Mapped[list["ScopeRuleModel"]] = relationship(back_populates="session", cascade="all, delete-orphan")
 
 
 class GraphNodeModel(Base):
@@ -149,3 +150,17 @@ class InterventionModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
     session: Mapped["SessionModel"] = relationship(back_populates="interventions")
+
+
+class ScopeRuleModel(Base):
+    """作用域规则表"""
+    __tablename__ = "scope_rules"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)  # UUID
+    session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id"), index=True)
+    scope_config: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
+
+    session: Mapped["SessionModel"] = relationship(back_populates="scope_rules")

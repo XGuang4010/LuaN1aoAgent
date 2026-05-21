@@ -536,10 +536,52 @@ async def api_ops_delete(op_id: str):
         s = result.scalar_one_or_none()
         if not s:
             raise HTTPException(status_code=404, detail="Session not found")
-        
+
         await session.delete(s)
         await session.commit()
     return {"ok": True}
+
+@app.get("/api/scope-defaults")
+async def get_scope_defaults():
+    """获取默认 Scope 配置"""
+    from conf.config import SCOPE_DEFAULTS
+    return {"defaults": SCOPE_DEFAULTS}
+
+@app.get("/api/ops/{op_id}/scope")
+async def get_scope_config(op_id: str):
+    """获取任务的 Scope 配置"""
+    from core.database.models import ScopeRuleModel
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ScopeRuleModel).where(ScopeRuleModel.session_id == op_id)
+        )
+        rule = result.scalar_one_or_none()
+        if rule:
+            return {"scope_config": rule.scope_config}
+        return {"scope_config": None}
+
+@app.post("/api/ops/{op_id}/scope")
+async def set_scope_config(op_id: str, request: Request):
+    """设置任务的 Scope 配置"""
+    from core.database.models import ScopeRuleModel
+    data = await request.json()
+    scope_config = data.get("scope_config", {})
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ScopeRuleModel).where(ScopeRuleModel.session_id == op_id)
+        )
+        rule = result.scalar_one_or_none()
+        if rule:
+            rule.scope_config = scope_config
+        else:
+            rule = ScopeRuleModel(
+                id=str(uuid.uuid4()),
+                session_id=op_id,
+                scope_config=scope_config
+            )
+            session.add(rule)
+        await session.commit()
+    return {"success": True, "scope_config": scope_config}
 
 @app.get("/api/events")
 async def api_events(request: Request, op_id: str):
@@ -741,6 +783,17 @@ async def api_ops_create(payload: Dict[str, Any]):
             session.add(new_session)
             await session.commit()
             _sse_logger.info(f"Session '{op_id}' created in database")
+
+            # 自动从默认值创建 ScopeRuleModel 记录
+            from conf.config import SCOPE_DEFAULTS
+            from core.database.models import ScopeRuleModel
+            scope_rule = ScopeRuleModel(
+                id=str(uuid.uuid4()),
+                session_id=op_id,
+                scope_config=SCOPE_DEFAULTS.copy()
+            )
+            session.add(scope_rule)
+            await session.commit()
 
         # Use start_new_session=True to detach the child process from the current process group
         # This makes the child process independent of the web server's lifespan

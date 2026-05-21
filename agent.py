@@ -69,6 +69,7 @@ from conf.config import (
     GLOBAL_MAX_TOKEN_USAGE
 )
 from core.events import broker
+from core.boundary import ScopeConfig, BoundaryValidator
 try:
     from web.server import register_graph
 except Exception:
@@ -96,6 +97,11 @@ def generate_task_id() -> str:
         格式为 "task_{timestamp}_{uuid_prefix}" 的唯一任务标识符
     """
     return f"task_{int(time.time())}_{str(uuid.uuid4())[:8]}"
+
+def _create_validator() -> BoundaryValidator:
+    """从全局配置创建边界校验器"""
+    scope = ScopeConfig.from_global_config()
+    return BoundaryValidator(scope)
 
 class KnowledgeServiceManager:
     """知识服务生命周期管理器 (Context Manager & Singleton pattern)"""
@@ -1041,7 +1047,8 @@ async def run_standalone_react(goal: str, task_name: str, log_dir: str, args: ar
     console.print(Panel("启动纯 ReAct 模式 (Ablation Mode C)...", style="bold magenta"))
     
     graph_manager = GraphManager(task_name, goal, op_id=op_id)
-    
+    validator = _create_validator()
+
     # 将整个任务封装为一个可以直接执行的子任务
     subtask_id = "global_react_execution"
     graph_manager.graph.add_node(subtask_id, 
@@ -1095,16 +1102,17 @@ async def run_standalone_react(goal: str, task_name: str, log_dir: str, args: ar
         
         from core.executor import run_executor_cycle
         _, status, cycle_metrics = await run_executor_cycle(
-            goal, 
-            subtask_id, 
-            llm, 
+            goal,
+            subtask_id,
+            llm,
             graph_manager,
-            global_mission_briefing, 
+            global_mission_briefing,
             log_dir=log_dir,
             save_callback=lambda: save_logs(log_dir, metrics, run_log),
             output_mode=effective_output_mode,
             max_steps=react_max_steps, # Explicitly pass max steps
-            disable_artifact_check=True # React mode should not stop on no new artifacts
+            disable_artifact_check=True, # React mode should not stop on no new artifacts
+            validator=validator
         )
         
         update_global_metrics(metrics, cycle_metrics)
@@ -1707,6 +1715,8 @@ async def main():
             for subtask_id in subtask_batch:
                 graph_manager.update_node(subtask_id, {"status": "in_progress"})
 
+            validator = _create_validator()
+
             # Define real-time save callback shared by all parallel tasks
             # Note: In parallel execution, this may cause transient metric flip-flops in logs,
             # but ensures at least one active task's progress is visible.
@@ -1721,7 +1731,8 @@ async def main():
                     global_mission_briefing, log_dir=log_dir,
                     save_callback=per_realtime_save,
                     output_mode=effective_output_mode,
-                    max_steps=graph_manager.graph.nodes[subtask_id].get('max_steps')))
+                    max_steps=graph_manager.graph.nodes[subtask_id].get('max_steps'),
+                    validator=validator))
                 for subtask_id in subtask_batch
             ]
             completed_results = await asyncio.gather(*tasks, return_exceptions=True)

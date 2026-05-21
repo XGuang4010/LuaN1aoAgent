@@ -253,3 +253,53 @@ KNOWLEDGE_SERVICE_URL = os.getenv("KNOWLEDGE_SERVICE_URL", f"http://{KNOWLEDGE_S
 # 是否开启人工介入模式
 # 开启后，Agent在生成规划后会暂停，等待Web UI或CLI的人工审批
 HUMAN_IN_THE_LOOP = os.getenv("HUMAN_IN_THE_LOOP", "false").lower() == "true"
+
+# ============================================================================
+# 作用域配置 (Scope Configuration)
+# ============================================================================
+
+SCOPE_DEFAULTS = {
+    # 被阻止的目标网段/地址
+    "blocked_targets": [
+        t.strip()
+        for t in os.getenv(
+            "SCOPE_BLOCKED_TARGETS",
+            "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8,169.254.0.0/16,0.0.0.0/8",
+        ).split(",")
+        if t.strip()
+    ],
+    # 允许的端口列表
+    "allowed_ports": [
+        int(p.strip())
+        for p in os.getenv("SCOPE_ALLOWED_PORTS", "80,443,8080,8443").split(",")
+        if p.strip()
+    ],
+    # 允许的目标
+    "allowed_targets": [
+        t.strip()
+        for t in os.getenv("SCOPE_ALLOWED_TARGETS", "*").split(",")
+        if t.strip()
+    ],
+    # 禁用的工具列表
+    "disabled_tools": [
+        t.strip()
+        for t in os.getenv("SCOPE_DISABLED_TOOLS", "").split(",")
+        if t.strip()
+    ],
+    # 是否禁用 shell_exec 工具
+    "disable_shell_exec": os.getenv("SCOPE_DISABLE_SHELL_EXEC", "false").lower() == "true",
+    # 是否禁用 python_exec 工具
+    "disable_python_exec": os.getenv("SCOPE_DISABLE_PYTHON_EXEC", "false").lower() == "true",
+    # 是否阻止访问私有网络
+    "block_private_network": os.getenv("SCOPE_BLOCK_PRIVATE_NETWORK", "true").lower() == "true",
+    # 是否阻止 DNS 重绑定攻击
+    "block_dns_rebinding": os.getenv("SCOPE_BLOCK_DNS_REBINDING", "true").lower() == "true",
+    # 是否强制 TLS 证书验证
+    "enforce_tls_verification": os.getenv("SCOPE_ENFORCE_TLS_VERIFICATION", "true").lower() == "true",
+    # 最大响应体大小（字节）
+    "max_response_size": int(os.getenv("SCOPE_MAX_RESPONSE_SIZE", "50000")),
+    # 每秒请求速率限制
+    "rate_limit_requests_per_sec": float(os.getenv("SCOPE_RATE_LIMIT_RPS", "10.0")),
+    # 最大并发连接数
+    "max_concurrent_connections": int(os.getenv("SCOPE_MAX_CONCURRENT_CONNECTIONS", "20")),
+}
