@@ -269,7 +269,7 @@ class StructuredObservation:
 
     def format_for_llm(self) -> str:
         """生成 LLM 友好摘要（替代旧的全量字符串拼接）. """
-        status_icon = {"success": "✅", "partial": "⚠️", "failed": "❌"}[self.status]
+        status_icon = {"success": "✅", "partial": "⚠️", "failed": "❌"}.get(self.status, "❓")
         parts = [f"{status_icon} [{self.tool}] {self.step_id}: {self.summary}"]
         if self.findings:
             cats = ", ".join(sorted(set(f.category for f in self.findings)))

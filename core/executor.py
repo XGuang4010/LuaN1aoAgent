@@ -919,8 +919,8 @@ async def run_executor_cycle(
                 if original_length > EXECUTOR_DB_OUTPUT_LENGTH:
                     db_result = result_str[:EXECUTOR_DB_OUTPUT_LENGTH]
 
-                # P2: Parse structured findings from tool output
-                tool_findings = parse_tool_output(tool_name, llm_result)
+                # P2: Parse structured findings from tool output (use full result, not truncated)
+                tool_findings = parse_tool_output(tool_name, result_str)
                 finding_categories = sorted(set(f.category for f in tool_findings))
 
                 # Build LLM-friendly summary with structured finding info
