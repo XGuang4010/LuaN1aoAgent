@@ -308,6 +308,31 @@ class GraphManager:
         
         return self.add_causal_node(payload)
 
+    def add_evidence(
+        self,
+        evidence_id: str,
+        category: str,
+        content: str | dict,
+        source_step: str,
+        confidence: float,
+        hypothesis_id: str | None = None,
+    ) -> str:
+        """Create an Evidence node via add_causal_node() and link to source step."""
+        artifact = {
+            "id": evidence_id,
+            "node_type": "Evidence",
+            "category": category,
+            "content": str(content)[:500] if isinstance(content, str) else str(content)[:500],
+            "source_step_id": source_step,
+            "confidence": confidence,
+            "raw_output": str(content)[:500],
+            "hypothesis_id": hypothesis_id or "",
+        }
+        node_id = self.add_causal_node(artifact)
+        if source_step and self.causal_graph.has_node(source_step):
+            self.add_causal_edge(source_step, node_id, "PRODUCES", confidence=confidence)
+        return node_id
+
     def add_causal_edge_obj(self, edge: "CausalEdge") -> None:
         if not hasattr(edge, "source_id") or not hasattr(edge, "target_id"):
             raise ValueError("CausalEdge object missing source_id/target_id")
