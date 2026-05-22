@@ -185,8 +185,16 @@
 
       <aside id="right-panel">
         <div id="llm-output-container">
-          <div class="panel-header">
+          <div class="panel-header" style="flex-wrap:wrap;gap:6px;">
             <span>Agent Logs (Output Only)</span>
+            <input id="log-search" placeholder="搜索日志..." style="flex:1;min-width:80px;padding:3px 8px;font-size:12px;background:var(--bg-input);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;outline:none;">
+            <select id="log-type-filter" multiple style="width:100px;padding:2px;font-size:11px;background:var(--bg-input);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;outline:none;">
+              <option value="executor" selected>executor</option>
+              <option value="planner" selected>planner</option>
+              <option value="reflector" selected>reflector</option>
+              <option value="system" selected>system</option>
+            </select>
+            <button id="btn-download-report" class="btn" style="display:none;font-size:11px;padding:3px 10px;" onclick="downloadReport()">下载报告</button>
             <span id="typing-indicator" style="display:none;color:var(--success)">● Live</span>
           </div>
           <div id="llm-stream" class="panel-content"></div>

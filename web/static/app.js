@@ -35,6 +35,108 @@ const PHASE_BANNER_ABORTED_BG = 'rgba(239, 68, 68, 0.95)';
 let state = { op_id: new URLSearchParams(location.search).get('op_id') || '', view: 'exec', simulation: null, svg: null, g: null, zoom: null, es: null, processedEvents: new Set(), pendingReq: null, isModifyMode: false, currentPhase: null, missionAccomplished: false, isAborted: false, taskStatus: null, userHasInteracted: false, lastActiveNodeId: null, isProgrammaticZoom: false, renderDebounceTimer: null, lastRenderTime: 0, isLoadingHistory: false, collapsedNodes: new Set(), userExpandedNodes: new Set(), leftSidebarCollapsed: false, rightSidebarCollapsed: false };
 const api = (p, b) => fetch(p + (p.includes('?') ? '&' : '?') + `op_id=${state.op_id}`, b ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) } : {}).then(r => r.json());
 
+// Log filtering state
+const logFilters = { search: "", types: new Set(["executor", "planner", "reflector", "system"]) };
+let logSearchDebounceTimer = null;
+
+function getLogCategory(msg, roleName) {
+  if (roleName && roleName !== 'SYSTEM') {
+    return roleName.toLowerCase();
+  }
+  const eventType = msg.event || '';
+  if (eventType.includes('executor')) return 'executor';
+  if (eventType.includes('planner')) return 'planner';
+  if (eventType.includes('reflector')) return 'reflector';
+  return 'system';
+}
+
+function matchesLogFilter(msg, roleName) {
+  const category = getLogCategory(msg, roleName);
+  if (!logFilters.types.has(category)) return false;
+  if (logFilters.search) {
+    const text = JSON.stringify(msg).toLowerCase();
+    if (!text.includes(logFilters.search.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function applyLogFilters() {
+  const container = document.getElementById('llm-stream');
+  if (!container) return;
+  const entries = container.querySelectorAll('.llm-msg');
+  const searchLower = logFilters.search.toLowerCase();
+  entries.forEach(el => {
+    const category = el.dataset.category || 'system';
+    const searchText = (el.dataset.searchText || '').toLowerCase();
+    let visible = logFilters.types.has(category);
+    if (visible && searchLower) {
+      visible = searchText.includes(searchLower);
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+
+function initLogFilters() {
+  const searchInput = document.getElementById('log-search');
+  const typeFilter = document.getElementById('log-type-filter');
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      if (logSearchDebounceTimer) clearTimeout(logSearchDebounceTimer);
+      logSearchDebounceTimer = setTimeout(() => {
+        logFilters.search = e.target.value;
+        applyLogFilters();
+      }, 300);
+    });
+  }
+  if (typeFilter) {
+    typeFilter.addEventListener('change', () => {
+      const selected = new Set(Array.from(typeFilter.selectedOptions).map(o => o.value));
+      logFilters.types = selected.size > 0 ? selected : new Set(['system']);
+      applyLogFilters();
+    });
+  }
+}
+
+async function downloadReport() {
+  if (!state.op_id) return;
+  const isZh = (window.currentLang || 'zh') === 'zh';
+  try {
+    const resp = await fetch(`/api/report/${state.op_id}/download`);
+    if (resp.status === 404) {
+      alert(isZh ? '报告文件未找到' : 'Report file not found');
+      return;
+    }
+    if (!resp.ok) {
+      alert(isZh ? '下载报告失败' : 'Failed to download report');
+      return;
+    }
+    const blob = await resp.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const disposition = resp.headers.get('Content-Disposition');
+    let filename = 'report.md';
+    if (disposition) {
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      if (match) filename = match[1];
+    }
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  } catch (e) {
+    alert((isZh ? '下载报告失败: ' : 'Failed to download report: ') + e.message);
+  }
+}
+
+function updateDownloadButtonVisibility() {
+  const btn = document.getElementById('btn-download-report');
+  if (!btn) return;
+  const taskDone = state.taskStatus && (state.taskStatus.achieved || state.taskStatus.failed || state.taskStatus.aborted);
+  btn.style.display = taskDone ? 'inline-flex' : 'none';
+}
+
 // 显示阶段横幅
 function showPhaseBanner(phase) {
   const banner = document.getElementById('phase-banner');
@@ -97,6 +199,7 @@ function showAbortedBanner() {
 
 document.addEventListener('DOMContentLoaded', () => {
   initD3();
+  initLogFilters();
   loadOps().then(() => { if (!state.op_id) { const f = document.querySelector('.task-card'); if (f) selectOp(f.dataset.op); } else selectOp(state.op_id, false); });
   setInterval(checkPendingIntervention, 2000);
 });
@@ -128,6 +231,7 @@ async function loadOps() {
         if (i.status.aborted || i.status.achieved || i.status.failed) {
           hidePhaseBanner();
         }
+        updateDownloadButtonVisibility();
       }
 
       li.innerHTML = `<div class="flex justify-between mb-1">
@@ -344,6 +448,8 @@ function selectOp(id, refresh = true) {
   } else {
     hidePhaseBanner(); // 隐藏阶段横幅，等待正确状态加载
   }
+
+  updateDownloadButtonVisibility();
 
   document.getElementById('node-detail-content').innerHTML = '<div style="padding:20px;text-align:center;color:#64748b">Loading...</div>';
   closeDetails();
@@ -2408,6 +2514,11 @@ function renderSystemEvent(msg) {
   const div = document.createElement('div');
   // 使用 role-system 样式
   div.className = 'llm-msg role-system';
+  div.dataset.category = 'system';
+  div.dataset.searchText = JSON.stringify(msg);
+  if (!matchesLogFilter(msg, 'SYSTEM')) {
+    div.style.display = 'none';
+  }
 
   const time = new Date(msg.timestamp ? msg.timestamp * 1000 : Date.now()).toLocaleTimeString();
   const eventType = msg.event;
@@ -2549,6 +2660,12 @@ function renderLLMResponse(msg, isHistory = false) {
   const container = document.getElementById('llm-stream');
   const div = document.createElement('div');
   div.className = `llm-msg ${roleClass}`;
+  const logCategory = getLogCategory(msg, roleName);
+  div.dataset.category = logCategory;
+  div.dataset.searchText = JSON.stringify(msg);
+  if (!matchesLogFilter(msg, roleName)) {
+    div.style.display = 'none';
+  }
 
   const time = new Date(msg.timestamp ? msg.timestamp * 1000 : Date.now()).toLocaleTimeString();
 

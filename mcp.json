@@ -2,7 +2,7 @@
   "mcpServers": {
     "tools": {
       "type": "stdio",
-      "command": "python",
+      "command": "./venv/Scripts/python.exe",
       "args": ["-u", "./tools/mcp_service.py"],
       "env": {
         "FASTMCP_NO_BANNER": "1",

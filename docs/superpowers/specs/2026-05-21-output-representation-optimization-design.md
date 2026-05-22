@@ -29,10 +29,10 @@
 
 ```
 当前:
-  Executor → str (raw output) → GraphNode.observation → Reflector → Planner
+  Executor → str (raw output) → data['observation'] → Reflector → Planner
 
 优化后:
-  Executor → StructuredObservation → GraphNode (observation + findings + evidence)
+  Executor → StructuredObservation → data['observation'] (observation + findings + evidence)
               ↓                    ↓                      ↓
           LLM 消息(摘要)      Web UI 详情面板        CausalGraph 证据节点
                                         ↓
@@ -138,12 +138,28 @@ messages.append({"role": "user", "content": formatted})
 
 ### 3.6 存储方案
 
+实际存储基于 `models.py` 的 `GraphNodeModel.data` JSON 列，所有字段存入其中：
+
 | 字段 | 存储位置 |
 |------|---------|
-| StructuredObservation | GraphNode.observation (JSON) |
-| ToolFinding.findings | GraphNode.findings (JSON list) |
-| raw_output | GraphNode.raw_output (JSON str) |
-| evidence_ids | GraphNode → CausalGraph Edge |
+| StructuredObservation | `data['observation']` (JSON) |
+| ToolFinding.findings | `data['findings']` (JSON list) |
+| raw_output | `data['raw_output']` (JSON str) |
+| evidence_ids | `data['evidence_ids']` (list[str]) + CausalGraph Edge |
+
+> **说明**：`GraphNodeModel` 的 `data` 列（`Mapped[Dict[str, Any]]`）是所有扩展信息的统一存储位置。旧数据的 `data['observation']` 为纯文本字符串，读取时按类型回退；
+> 新旧兼容逻辑：
+> ```python
+> data = node.data or {}
+> raw = data.get("observation", "")
+> if isinstance(raw, str):
+>     # 旧格式：直接回退为 raw_output
+>     obs = StructuredObservation(raw_output=raw, ...)
+> else:
+>     # 新格式：data['observation'] 为 StructuredObservation 字典
+>     obs = StructuredObservation(**raw)
+> findings = data.get("findings", [])
+> ```
 
 ---
 
@@ -190,7 +206,22 @@ def fallback_parser(output: str) -> list[ToolFinding]:
 
 ### 4.5 证据节点自动写入
 
-Executor 在构建 StructuredObservation 后，遍历 findings，对每条调用：
+Executor 在构建 StructuredObservation 后，遍历 findings，对每条调用新增的 `add_evidence()` 方法：
+
+```python
+# GraphManager 新增方法签名
+def add_evidence(
+    self,
+    category: str,          # finding category
+    content: str | dict,    # finding value
+    source_step: str,       # 来源 substep_id
+    confidence: float,      # 0.0-1.0
+    hypothesis_id: str | None = None,  # 可选关联假设
+) -> str:                   # 返回 evidence_node_id
+    """在因果图谱中创建 Evidence 节点并关联到来源步骤。"""
+```
+
+Executor 调用：
 ```python
 evidence_node_id = graph_manager.add_evidence(
     category=f.category,
@@ -293,11 +324,25 @@ GET /api/evidence/{evidence_id}/chain     → 完整因果链（节点列表 + �
 | 文件 | 改动 |
 |------|------|
 | `core/data_contracts.py` | 新增 ToolFinding、ToolError、StructuredObservation |
-| `core/executor.py` | 重构 observation 构建逻辑、LLM 消息格式化、错误分类扩展 |
-| `core/graph_manager.py` | 新增 add_evidence() 方法 |
+| `core/executor.py` | 重构 observation 构建逻辑、LLM 消息格式化、错误分类扩展；**见下方删除清单** |
+| `core/graph_manager.py` | 新增 `add_evidence()` 方法 |
 | `web/server.py` | 新增 API 路由（node detail、evidence、chat） |
 | `web/static/app.js` | DAG 节点点击事件、详情面板 UI、对话 widget、证据视图 |
 | `web/templates/index.html` | 面板和对话对话框的 CSS/HTML 模板 |
+
+### 7.3 旧代码删除/替换清单 (P1 实施时)
+
+实施 P1 `StructuredObservation` 时，`core/executor.py` 中的以下代码需同步删除或替换：
+
+| 行号范围 (当前) | 操作 | 原因 |
+|-----------------|------|------|
+| `observations.append(f"动作 {step_id}...")` (当前 ~886) | **替换**为 `observations.append(StructuredObservation(...))` | 字符串 → 结构化对象 |
+| `result_str[:MAX_OBSERVATION_LENGTH] + f"... (Truncated from...)"` (当前 ~872-884) | **保留**截断逻辑，但**替换**截断方式 | 改为双缓冲区截断，raw_output 保留 200K |
+| `full_observation = "\n".join(observations)` (当前 ~932) | **删除** | 改为新格式化逻辑 |
+| `messages.append({"role":"user", "content": f"...{full_observation}"})` (当前 ~933) | **替换**为第 3.3 节的新格式化逻辑 | 结构化 → LLM 友好摘要 |
+| 旧错误判断 (if "SyntaxError" in result 等) | **替换**为 `parse_errors()` + `ToolError` | 扩展为 7 类错误分类 |
+
+> **原则**：只删已经**被新功能完全替代**的旧逻辑。数据结构升级是正常的架构演进，不是破坏。
 
 ---
 
@@ -314,7 +359,8 @@ GET /api/evidence/{evidence_id}/chain     → 完整因果链（节点列表 + �
 
 ## 9. 注意事项
 
-- **向后兼容**：StructuredObservation 序列化为 JSON 存入 GraphNode.observation 字段，旧数据读取为纯文本时正常回退
+- **向后兼容**：StructuredObservation 序列化为 JSON 存入 `data['observation']` 字段，旧数据读取为纯文本时正常回退（见第 3.6 节兼容逻辑）
 - **对话隔离**：`POST /api/task/{op_id}/chat` 使用独立的 LLM 会话，system prompt 不含 MCP 工具描述
 - **截断保护**：raw_output 在 DB 层前先截断（200K chars），防止数据库过大
 - **Web UI 更新**：所有 UI 变更追加到现有的 `web/static/app.js`，不引入前端框架依赖
+- **旧代码删除**：实施 P1 时同步删除/替换第 7.3 节清单中的旧代码。数据结构升级是架构演进的正常过程，新代码完全覆盖旧功能后即可清理

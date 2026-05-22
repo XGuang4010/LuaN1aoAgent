@@ -23,6 +23,7 @@ import subprocess
 import time
 import logging
 from typing import Dict, Any, List, Optional
+
 from http.server import BaseHTTPRequestHandler
 import sys
 import os
@@ -80,9 +81,6 @@ import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
 warnings.filterwarnings("ignore", category=FutureWarning)
-
-from tools.tool_env import resolve_project_tool
-from core.boundary import ScopeConfig, BoundaryValidator, BoundaryCheckResult
 
 # 配置日志
 # Ensure logs directory exists
@@ -1019,13 +1017,14 @@ def _coerce_bool(value, default=False):
     return default
 
 
-def _get_validator_from_context(ctx) -> Optional[BoundaryValidator]:
+def _get_validator_from_context(ctx):
     """从 MCP 上下文获取边界校验器，如果未配置则返回 None"""
     if ctx is None:
         return None
-    scope_data = getattr(ctx, 'request_context', {}).get('scope_config', None)
-    if scope_data:
-        return BoundaryValidator(ScopeConfig(**scope_data))
+    # ctx is a FastMCP Context object. ctx.request_context returns a
+    # mcp.shared.context.RequestContext dataclass (not a dict), so .get()
+    # cannot be called on it. Scope config is not passed through the MCP
+    # protocol — primary boundary validation happens at the Executor layer.
     return None
 
 @mcp.tool()

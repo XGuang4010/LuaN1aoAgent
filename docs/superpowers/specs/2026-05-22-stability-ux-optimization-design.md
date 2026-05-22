@@ -1,7 +1,7 @@
 # LuaN1ao Agent 系统稳定性与用户体验优化设计
 
 > **日期**: 2026-05-22
-> **状态**: 设计定稿，待审阅
+> **状态**: 已审阅修订，待确认
 > **基于分析**: api.dxmpay.com 任务运行日志与 P1-P4 输出表征优化复盘
 
 ---
@@ -25,10 +25,9 @@
 | # | 问题 | 影响 | 日志证据 |
 |---|------|------|----------|
 | 1 | **Agent 异常退出无恢复** | 任务在第 2 步准备阶段终止，`end_time=null`，深度探测未执行 | `metrics.json` 中 `end_time: null`，`total_time_seconds: 36.25s` |
-| 2 | **LLM API 400 错误（json_object 不支持）** | Planner 结构化输出失败，降级为文本解析，规划质量下降 | `console_output.log: "response_format.type...json_object is not supported"` |
-| 3 | **外部工具缺失仅 Warning** | `searchsploit` 未安装，但任务继续，工具实际失效 | `console_output.log: "WARNING - searchsploit not found"` |
-| 4 | **Web Server 后台运行不稳定** | Windows Git Bash 下 `python -m web.server` 约 2 分钟后自动退出 | 端口 8000 失去监听，需手动重启 |
-| 5 | **任务无法断点续传** | 进程重启后需从头开始，已消耗 Token 和时间浪费 | 无 checkpoint 机制 |
+| 2 | **外部工具缺失仅 Warning** | `searchsploit` 未安装，但任务继续，工具实际失效 | `console_output.log: "WARNING - searchsploit not found"` |
+| 3 | **Web Server 后台运行不稳定** | Windows Git Bash 下 `python -m web.server` 约 2 分钟后自动退出 | 端口 8000 失去监听，需手动重启 |
+| 4 | **任务无法断点续传** | 进程重启后需从头开始，已消耗 Token 和时间浪费 | 无 checkpoint 机制 |
 
 ---
 
@@ -38,9 +37,8 @@
 优化方向
 ├── 系统稳定性层（System Stability）
 │   ├── Agent 异常熔断与自动恢复
-│   ├── LLM 能力探测与自动降级
 │   ├── 启动前环境校验（工具/模型/配置）
-│   ├── 进程守护（Web Server / Agent）
+│   ├── 进程启动方式标准化（Web Server / Agent）
 │   └── 任务断点续传（Checkpoint & Resume）
 │
 ├── 功能增强层（Feature Enhancement）
@@ -108,57 +106,9 @@ async def resume_pending_tasks():
 - [ ] 异常退出时 DB 中任务状态变为 `crashed`，并记录异常信息
 - [ ] 恢复后 Executor 的 `messages` 列表保持连续性
 
-### 3.2 LLM 能力探测与自动降级
+> **注**：用户已明确将通过更换 LLM 渠道解决此问题，此优化项从本次实施计划中移除，不纳入任何 Phase。
 
-**目标**：启动时自动探测模型是否支持 `json_object` / `json_schema`，不支持时自动关闭，避免运行时 400 错误。
-
-**现状问题**：
-- `llm_client.py` 直接按配置发送 `response_format`，不处理模型不支持的情况
-- Planner 收到 400 后降级为文本解析，但规划质量受损
-
-**设计方案**：
-
-```python
-# llm/llm_client.py 新增能力探测
-class LLMClient:
-    def __init__(self, ...):
-        self.capabilities = self._probe_capabilities()
-    
-    def _probe_capabilities(self) -> dict:
-        """发送探测请求，检测模型支持的能力。"""
-        capabilities = {
-            "json_mode": False,
-            "function_calling": False,
-            "streaming": False,
-        }
-        # 测试 json_mode
-        try:
-            test_resp = self._raw_chat_completion(
-                messages=[{"role": "user", "content": "say hi"}],
-                response_format={"type": "json_object"},
-                max_tokens=10,
-            )
-            capabilities["json_mode"] = True
-        except Exception as e:
-            if "json_object" in str(e) or "response_format" in str(e):
-                logger.warning("当前模型不支持 json_object，Planner 将使用文本解析模式")
-            else:
-                raise
-        return capabilities
-    
-    async def chat_completion(self, messages, response_format=None, **kwargs):
-        """根据探测结果自动决定是否传入 response_format。"""
-        if response_format and not self.capabilities["json_mode"]:
-            response_format = None  # 自动降级
-        return await self._raw_chat_completion(messages, response_format=response_format, **kwargs)
-```
-
-**验收标准**：
-- [ ] 启动时打印模型能力清单（`json_mode: False` 等）
-- [ ] 不支持 `json_object` 的模型不再触发 400 错误
-- [ ] Planner 在文本模式下仍能正确提取图操作指令
-
-### 3.3 启动前环境校验
+### 3.2 启动前环境校验
 
 **目标**：Agent 启动前自动检查所有依赖，缺失时给出明确修复指引，而不是运行时才发现。
 
@@ -173,8 +123,8 @@ async def preflight_check() -> list[CheckResult]:
     # 1. LLM API 连通性
     checks.append(await check_llm_connectivity())
     
-    # 2. 工具可执行文件存在性
-    tools = ["nmap", "dirsearch", "httpx", "nuclei", "sqlmap", "subfinder", "searchsploit"]
+    # 2. 工具可执行文件存在性（从 mcp.json 动态读取注册工具，避免硬编码）
+    tools = load_registered_tools_from_mcp_config()
     for tool in tools:
         checks.append(check_tool_available(tool))
     
@@ -204,53 +154,46 @@ def print_preflight_report(checks: list[CheckResult]):
 
 **验收标准**：
 - [ ] 启动时输出 5 项校验结果，总耗时 < 3 秒
-- [ ] `searchsploit` 缺失时提示：`pip install exploitdb` 或 `apt install exploitdb`
+- [ ] `searchsploit` 缺失时提示：从 GitHub 下载 `exploitdb` 并配置 `SEARCHSPLOIT_PATH`，或 `apt install exploitdb`（Kali/Linux）
 - [ ] 任意校验失败时，Agent 可选择 `--skip-preflight` 强制启动
 
-### 3.4 进程守护
+### 3.4 进程启动方式标准化
 
-**目标**：Web Server 和 Agent 进程崩溃后自动重启。
+**目标**：解决 Windows Git Bash 下后台进程自动退出的问题，提供跨平台稳定启动方案。
+
+**现状问题**：
+- Windows Git Bash 中 `python -m web.server` 作为后台 job 运行时，约 2 分钟后随 shell session 退出
+- 这不是进程 crash，而是 shell job control 的行为，自建 Python watchdog 同样会被杀死
 
 **设计方案**：
 
-**方案 A（推荐）—— Python 内置 watchdog：**
+**方案 A（推荐）—— 直接使用 uvicorn（已验证有效）：**
 
-```python
-# core/process_supervisor.py
-import subprocess
-import time
-import psutil
+```bash
+# 正确的启动方式（不依赖 shell job control）
+python -m uvicorn web.server:app --host 127.0.0.1 --port 8000 --reload
 
-class ProcessSupervisor:
-    """进程守护：监控目标进程，崩溃后自动重启。"""
-    
-    def __init__(self, cmd: list[str], name: str, restart_delay: int = 3):
-        self.cmd = cmd
-        self.name = name
-        self.restart_delay = restart_delay
-        self.process = None
-        self.restart_count = 0
-    
-    def start(self):
-        while True:
-            logger.info(f"[{self.name}] 启动进程...")
-            self.process = subprocess.Popen(self.cmd)
-            self.process.wait()
-            self.restart_count += 1
-            logger.warning(
-                f"[{self.name}] 进程退出 (code={self.process.returncode}), "
-                f"{self.restart_delay}秒后重启 (第{self.restart_count}次)"
-            )
-            time.sleep(self.restart_delay)
+# Windows 后台（使用 pythonw.exe 避免控制台窗口）
+pythonw -m uvicorn web.server:app --host 127.0.0.1 --port 8000
 ```
 
-**方案 B — 系统级 supervisor（文档说明）：**
-- Windows: 提供 `supervise-agent.ps1` PowerShell 脚本
-- Linux/macOS: 提供 `supervise-agent.sh` + systemd service 配置
+**方案 B — 系统级守护（生产环境）：**
+
+提供配置模板，不自建 watchdog：
+
+- **Windows**: 提供 `scripts/supervise-agent.ps1`（循环检测进程 + 日志轮转）
+- **Linux/macOS**: 提供 `scripts/luan1ao-agent.service`（systemd 配置）
+- **通用**: 推荐使用 `supervisor` / `pm2` 等成熟进程管理工具
+
+**为什么不用 Python watchdog：**
+1. `subprocess.Popen` + `wait()` 会**阻塞 asyncio 事件循环**
+2. Git Bash 下 watchdog 进程本身是 shell 子进程，session 结束同样退出
+3. 新增 `psutil` 依赖，收益有限
 
 **验收标准**：
-- [ ] `kill -9` Web Server 进程后，3 秒内自动恢复监听
-- [ ] 连续崩溃 5 次后停止重启，避免无限循环
+- [ ] 更新 README/文档，明确记录正确的启动命令
+- [ ] 提供 systemd service 配置文件模板
+- [ ] Agent 异常退出后，DB 状态变为 `crashed`（由 3.1 负责），不依赖进程守护自动重启
 
 ### 3.5 任务断点续传（Checkpoint & Resume）
 
@@ -260,34 +203,38 @@ class ProcessSupervisor:
 
 ```python
 # core/checkpoint.py
-import pickle
+import json
 import os
 
 CHECKPOINT_DIR = "logs/checkpoints"
 
 async def save_checkpoint(op_id: str, cycle_num: int, context: dict):
-    """保存执行上下文到 checkpoint 文件。"""
-    path = os.path.join(CHECKPOINT_DIR, f"{op_id}_cycle_{cycle_num}.pkl")
+    """保存执行上下文到 checkpoint 文件（JSON 格式，安全且可版本控制）。"""
+    path = os.path.join(CHECKPOINT_DIR, f"{op_id}_cycle_{cycle_num}.json")
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    with open(path, "wb") as f:
-        pickle.dump(context, f)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(context, f, ensure_ascii=False, indent=2)
     # 保留最近 5 个 checkpoint，删除旧的
     cleanup_old_checkpoints(op_id, keep=5)
 
 async def load_latest_checkpoint(op_id: str) -> dict | None:
     """加载最新的 checkpoint。"""
-    checkpoints = sorted(glob(f"{CHECKPOINT_DIR}/{op_id}_cycle_*.pkl"))
+    checkpoints = sorted(glob(f"{CHECKPOINT_DIR}/{op_id}_cycle_*.json"))
     if not checkpoints:
         return None
-    with open(checkpoints[-1], "rb") as f:
-        return pickle.load(f)
+    with open(checkpoints[-1], "r", encoding="utf-8") as f:
+        return json.load(f)
 
 # 在 agent.py 主循环中每周期调用
+# 不保存完整 messages（可能很大且含非 JSON 序列化对象），
+# 只保存可重建状态：cycle_num、graph_state、summary、observations 元数据
 context = {
-    "messages": messages,
-    "observations": observations,
+    "version": 1,  # checkpoint 格式版本号，用于未来兼容
     "cycle_num": cycle_num,
     "graph_state": graph_manager.export_state(),
+    "last_summary": last_compressed_summary,  # 压缩后的对话摘要
+    "observation_metadata": [obs.to_dict() for obs in observations],
+    "timestamp": time.time(),
 }
 await save_checkpoint(op_id, cycle_num, context)
 ```
@@ -295,7 +242,8 @@ await save_checkpoint(op_id, cycle_num, context)
 **验收标准**：
 - [ ] 每完成一个 P-E-R 周期自动生成 checkpoint（< 100ms）
 - [ ] 重启 Agent 时检测到 checkpoint，提示用户是否恢复
-- [ ] 恢复后 `messages` 历史完整，LLM 上下文不丢失
+- [ ] 恢复后从 `last_summary` 重建 LLM 上下文，不依赖完整 messages 列表
+- [ ] checkpoint 文件为纯 JSON，可人工查看和调试
 
 ---
 
@@ -322,15 +270,9 @@ function drawCausalEdges(svg, causalEdges) {
         .attr("stroke-dasharray", "5,5")
         .attr("fill", "none");
     
-    // 流动动画
-    function animate() {
-        links.attr("stroke-dashoffset", function() {
-            const offset = d3.select(this).attr("stroke-dashoffset") || 0;
-            return +offset - 1;
-        });
-        requestAnimationFrame(animate);
-    }
-    animate();
+    // 流动动画（使用 CSS animation，避免 JS 与 CSS 冲突）
+    links.attr("stroke-dashoffset", 10)
+         .style("animation", "flow 1s linear infinite");
 }
 ```
 
@@ -418,11 +360,17 @@ class GraphManager:
         return reset_ids
     
     def _get_downstream_nodes(self, node_id: str) -> list[str]:
-        """获取指定节点的所有下游节点（递归）。"""
+        """获取指定节点的所有下游节点（BFS，避免深图栈溢出）。"""
         downstream = []
-        for _, target in self.execution_graph.out_edges(node_id):
-            downstream.append(target)
-            downstream.extend(self._get_downstream_nodes(target))
+        queue = [node_id]
+        visited = {node_id}
+        while queue:
+            current = queue.pop(0)
+            for _, target in self.execution_graph.out_edges(current):
+                if target not in visited:
+                    visited.add(target)
+                    downstream.append(target)
+                    queue.append(target)
         return downstream
 ```
 
@@ -536,12 +484,29 @@ async def restart_node(node_id: str, request: dict):
 | 使用场景 | 系统异常恢复 | 用户修正错误后重试 |
 | 上游数据 | 全部保留 | 全部保留 |
 
+**关键注意事项 —— Executor Messages 同步**：
+
+节点状态被清空后，`Executor` 维护的 `self.messages` 列表中仍包含该节点的旧观察结果，会导致 LLM 基于过期上下文做决策。必须在重启时同步清理：
+
+```python
+# core/executor.py
+class Executor:
+    def purge_messages_for_node(self, node_id: str):
+        """从 messages 列表中删除与指定节点相关的 user/assistant 消息对。"""
+        # 根据 node_id 标记过滤，保留系统消息和其他节点的上下文
+        self.messages = [
+            msg for msg in self.messages
+            if msg.get("node_id") != node_id
+        ]
+```
+
 **验收标准**：
 - [ ] 右键点击 DAG 节点显示「仅重启此节点」和「重启此节点及下游」选项
 - [ ] 重启后节点状态变为 `pending`，观察结果清空
 - [ ] 上游节点（已完成的兄弟/父节点）状态和数据不受影响
 - [ ] Agent 自动检测 pending 节点并执行，无需手动重启 Agent 进程
 - [ ] 级联重置正确计算所有下游节点（通过拓扑排序验证）
+- [ ] 重启后 Executor messages 中不包含该节点的旧 observation
 
 ### 4.3 任务完成自动报告生成
 
@@ -621,46 +586,52 @@ function renderLogEntry(event, data) {
 - [ ] 可按类型勾选显示/隐藏（如只看 executor 错误）
 - [ ] 过滤后支持导出当前视图
 
-### 4.5 启动向导
+### 4.5 环境配置检查脚本
 
-**目标**：首次运行或配置不完整时，引导用户完成必要配置。
+**目标**：提供一个非交互式的环境检查命令，供用户在启动前快速验证配置和依赖。
 
 **设计方案**：
 
 ```python
-# core/onboarding.py
-async def run_onboarding_wizard():
-    """交互式启动向导。"""
-    print("🦅 欢迎使用 LuaN1ao Agent 启动向导")
+# core/preflight.py（替代原 onboarding.py，无交互）
+def run_env_check() -> list[CheckResult]:
+    """非交互式环境检查，输出报告后退出。"""
+    checks = []
     
-    # Step 1: LLM API 配置
-    if not os.getenv("LLM_API_KEY"):
-        key = input("请输入 LLM API Key: ")
-        set_env("LLM_API_KEY", key)
+    # 1. LLM API Key 是否存在
+    checks.append(check_env_var("LLM_API_KEY"))
     
-    # Step 2: 工具目录配置
-    if not os.getenv("TOOLS_HOME"):
-        path = input(f"请输入工具安装目录 [默认: D:\Tools\PentestWorkspace]: ")
-        set_env("TOOLS_HOME", path or "D:\Tools\PentestWorkspace")
+    # 2. LLM API 连通性（发一条轻量请求）
+    checks.append(check_llm_connectivity())
     
-    # Step 3: 模型能力测试
-    print("正在测试模型能力...")
-    caps = await probe_model_capabilities()
-    print(f"  json_mode: {'✅' if caps['json_mode'] else '❌'}")
-    print(f"  streaming: {'✅' if caps['streaming'] else '❌'}")
+    # 3. 工具可执行文件（从 mcp.json 动态读取）
+    for tool in load_registered_tools_from_mcp_config():
+        checks.append(check_tool_available(tool))
     
-    # Step 4: 工具检查
-    print("检查工具可用性...")
-    for tool, status in check_all_tools().items():
-        print(f"  {tool}: {'✅' if status else '❌'}")
+    # 4. 数据库可写
+    checks.append(check_database_writable())
+    
+    # 5. RAG 服务可达
+    checks.append(check_knowledge_service())
+    
+    return checks
+
+# 使用方式（CLI 一次性检查）
+# python -m agent --check-env
 ```
 
-**Web UI 对应**：首次打开 Web 监控台时，若检测到无任务历史，弹出配置引导模态框。
+**为什么不使用交互式向导**：
+- 目标用户是安全工程师/开发者，`input()` 式向导过于"傻瓜化"
+- `input()` 在异步事件中会阻塞 asyncio 事件循环
+- 写 `.env` 需要解析/重写逻辑，增加维护成本
+- 非交互式脚本更适合 CI/CD 和自动化部署
+
+**Web UI 对应**：保留首次打开时的配置引导模态框（仅展示，不强制交互），作为文档补充。
 
 **验收标准**：
-- [ ] 首次启动自动进入向导，总步骤 < 5 步
-- [ ] 配置自动写入 `.env` 文件
-- [ ] 向导结束后自动校验，全部通过才进入主界面
+- [ ] `python -m agent --check-env` 输出 5 项检查结果，总耗时 < 3 秒
+- [ ] 检查失败时返回非 0 退出码，方便脚本判断
+- [ ] 不阻塞、不写文件、不改配置，只读检查
 
 ### 4.6 任务模板库
 
@@ -805,7 +776,6 @@ class Notifier:
 | 优先级 | 优化项 | 预计工时 | 影响 |
 |--------|--------|----------|------|
 | P0 | Agent 异常熔断与自动恢复 | 3-4h | 任务不再中途退出 |
-| P0 | LLM 能力探测与自动降级 | 2h | 消除 400 错误 |
 | P0 | 启动前环境校验 | 2-3h | 提前发现工具缺失 |
 
 ### Phase 2（2 周内）—— 核心功能增强
@@ -813,7 +783,7 @@ class Notifier:
 | 优先级 | 优化项 | 预计工时 | 影响 |
 |--------|--------|----------|------|
 | P1 | 任务断点续传 | 4-5h | 异常后可恢复 |
-| P1 | 进程守护 | 2h | 服务稳定运行 |
+| P1 | 进程启动方式标准化 | 1h | 服务稳定运行 |
 | P1 | DAG 节点重启与增量执行 | 4h | 避免重建整个任务 |
 | P1 | 实时日志过滤搜索 | 3h | 调试效率提升 |
 | P1 | 任务完成自动报告 | 4h | 交付物自动化 |
@@ -822,7 +792,7 @@ class Notifier:
 
 | 优先级 | 优化项 | 预计工时 | 影响 |
 |--------|--------|----------|------|
-| P2 | 启动向导 | 3h | 降低上手门槛 |
+| P2 | 环境配置检查脚本 | 1h | 快速验证环境 |
 | P2 | 任务模板库 | 2h | 快速开始任务 |
 | P2 | 假设验证追踪面板 | 3h | 因果推理可视化 |
 | P2 | 实时因果链动画 | 4h | DAG 视觉升级 |
@@ -837,13 +807,13 @@ class Notifier:
 ### 新增文件
 | 文件 | 说明 |
 |------|------|
-| `core/checkpoint.py` | 断点续传逻辑 |
-| `core/preflight.py` | 启动前环境校验 |
-| `core/process_supervisor.py` | 进程守护 |
+| `core/checkpoint.py` | 断点续传逻辑（JSON 格式） |
+| `core/preflight.py` | 启动前环境校验 + `--check-env` 命令 |
 | `core/notifier.py` | 告警通知 |
 | `core/report_generator.py` | 自动报告生成 |
-| `core/onboarding.py` | 启动向导 |
 | `conf/task_templates.yaml` | 任务模板配置 |
+| `scripts/supervise-agent.ps1` | Windows 进程守护脚本（PowerShell） |
+| `scripts/luan1ao-agent.service` | Linux systemd 配置模板 |
 | `tests/core/test_checkpoint.py` | 断点续传测试 |
 | `tests/core/test_preflight.py` | 环境校验测试 |
 | `tests/core/test_restart_node.py` | 节点重启与级联重置测试 |
@@ -852,18 +822,17 @@ class Notifier:
 | 文件 | 改动 |
 |------|------|
 | `agent.py` | 主循环加 `try/except`，启动时调用 `preflight_check()`，结束时调用 `report_generator` |
-| `llm/llm_client.py` | 新增 `_probe_capabilities()`，修改 `chat_completion()` 自动降级 |
-| `core/executor.py` | 每周期结束调用 `save_checkpoint()` |
+| `core/executor.py` | 每周期结束调用 `save_checkpoint()`；新增 `purge_messages_for_node()` |
 | `core/graph_manager.py` | 新增 `export_state()` / `import_state()`、`restart_node()` 方法 |
 | `web/server.py` | 新增 `/api/report/{op_id}/download`、`/api/node/{node_id}/restart` 端点 |
 | `web/static/app.js` | 日志过滤、假设面板、多任务管理、因果链动画、节点右键菜单（重启） |
-| `web/templates/index.html` | 新增过滤控件、向导模态框、响应式 CSS |
+| `web/templates/index.html` | 新增过滤控件、响应式 CSS |
 
 ---
 
 ## 8. 注意事项
 
-- **向后兼容**：Checkpoint 格式使用 pickle + 版本号，未来格式升级时自动迁移旧 checkpoint
-- **资源控制**：进程守护设置最大重启次数（5 次），避免无限循环消耗资源
+- **向后兼容**：Checkpoint 使用 JSON 格式并包含 `version` 字段，未来格式升级时根据版本号做兼容处理
+- **资源控制**：系统级进程守护（systemd/supervisor）应配置最大重启次数（5 次），避免无限循环
 - **敏感信息**：自动报告生成时，日志中的 API Key、Token 需自动脱敏（`***` 替换）
 - **通知降噪**：告警通知设置冷却时间（同一任务 5 分钟内不重复发送同类告警）

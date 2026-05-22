@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 import ipaddress
 import re
+from urllib.parse import urlparse
 
 
 @dataclass
@@ -91,7 +92,9 @@ class BoundaryValidator:
         # 3. 目标地址检查（从 params 中提取 url/host/target）
         target = self._extract_target(params)
         if target:
-            result = self.validate_target(target)
+            # 从 URL 或 params 中提取端口
+            port = self._extract_port(params)
+            result = self.validate_target(target, port)
             if not result.allowed:
                 return result
         
@@ -144,7 +147,41 @@ class BoundaryValidator:
         for key in ["url", "host", "target", "domain", "ip"]:
             val = params.get(key)
             if val:
-                return str(val)
+                raw = str(val)
+                # 如果是完整 URL，解析出 hostname
+                if key == "url" and ("://" in raw or raw.startswith("//")):
+                    try:
+                        parsed = urlparse(raw)
+                        if parsed.hostname:
+                            return parsed.hostname
+                    except Exception:
+                        pass
+                return raw
+        return None
+
+    def _extract_port(self, params: Dict) -> Optional[int]:
+        """从 params 中提取端口号，优先从 URL 解析，其次用显式 port 参数。"""
+        # 优先用显式 port 参数
+        port = params.get("port")
+        if port is not None:
+            try:
+                return int(port)
+            except (ValueError, TypeError):
+                pass
+        # 从 URL 解析
+        url = params.get("url")
+        if url:
+            try:
+                parsed = urlparse(str(url))
+                if parsed.port:
+                    return parsed.port
+                # 默认端口映射
+                if parsed.scheme == "https":
+                    return 443
+                if parsed.scheme == "http":
+                    return 80
+            except Exception:
+                pass
         return None
 
     def _resolve_to_ip(self, host: str) -> str:

@@ -417,6 +417,45 @@ LuaN1ao 在标准渗透测试基准任务上表现优秀：
 
 ---
 
+## 外部工具安装规范
+
+除 AI Agent 内置的 MCP 工具（`http_request`、`shell_exec`、`python_exec` 等）外，所有第三方渗透测试工具统一安装到 `TOOLS_HOME` 指定的目录下。
+
+### 配置方式
+
+- **变量名**：`TOOLS_HOME`
+- **配置文件**：项目根目录 `.env`
+- **当前值**：`D:\Tools\PentestWorkspace`
+
+### 目录规范
+
+每个工具在 `TOOLS_HOME` 下拥有独立的子目录，命名规则为工具名称全小写：
+
+```
+D:\Tools\PentestWorkspace\
+├── nmap/             # nmap.exe 直接在此目录下
+├── dirsearch/        # dirsearch 扫描器
+├── httpx/            # httpx HTTP 探测工具
+├── nuclei/           # nuclei 漏洞扫描器
+├── sqlmap/           # sqlmap SQL 注入工具
+├── subfinder/        # subfinder 子域名发现工具
+└── searchsploit/     # searchsploit 漏洞搜索工具
+```
+
+### 解析规则（三层优先级）
+
+1. **单工具环境变量**（最高优先级）：如 `NMAP_PATH`、`DIRSEARCH_PATH`，指定工具的完整路径
+2. **`TOOLS_HOME` 约定路径**：`${TOOLS_HOME}/${tool_name}/${tool_name}.exe`
+3. **直接失败**：不依赖系统 `PATH` 兜底，未配置时明确报错
+
+### 添加新工具流程
+
+1. 将工具安装到 `$TOOLS_HOME/<tool-name>/` 目录下
+2. 验证工具可执行文件位置：`$TOOLS_HOME/<tool-name>/<tool-name>.exe`
+3. 可选：在 `.env` 中添加对应的单工具路径变量（如 `NMAP_PATH=D:\Tools\PentestWorkspace\nmap\nmap.exe`）覆盖默认路径
+
+---
+
 ## 贡献指南
 
 欢迎所有形式的贡献！请参考 [CONTRIBUTING.md](file:///d:/Projects/LuaN1aoAgent/CONTRIBUTING.md) 了解详细流程。

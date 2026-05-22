@@ -52,6 +52,7 @@ from core.planner import Planner
 from core.reflector import Reflector
 from core.executor import run_executor_cycle
 from core.data_contracts import PlannerContext, ReflectorContext
+from core.report_generator import PentestReportGenerator
 from tools import mcp_service
 from core.tool_manager import tool_manager
 from core.intervention import intervention_manager

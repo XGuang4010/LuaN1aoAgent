@@ -12,7 +12,7 @@ from typing import Any, Dict, List
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -315,6 +315,30 @@ async def api_ops_detail(op_id: str):
             "created_at": s.created_at.timestamp(),
             "summary": "Full summary generation not implemented in DB mode yet."
         }
+
+@app.get("/api/report/{op_id}/download")
+async def api_report_download(op_id: str):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(select(SessionModel).where(SessionModel.id == op_id))
+        s = result.scalar_one_or_none()
+        if not s:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        task_name = s.name or "unknown"
+        # Check logs/{task_name}/{op_id}/report.md
+        report_path = PROJECT_ROOT / "logs" / task_name / op_id / "report.md"
+        if not report_path.exists():
+            # Fallback: check logs/{task_name}/report.md
+            report_path = PROJECT_ROOT / "logs" / task_name / "report.md"
+
+        if not report_path.exists():
+            raise HTTPException(status_code=404, detail="Report not found")
+
+        content = report_path.read_text(encoding="utf-8")
+        return PlainTextResponse(
+            content=content,
+            headers={"Content-Disposition": f'attachment; filename="report_{op_id}.md"'}
+        )
 
 @app.get("/api/graph/execution")
 async def api_graph_execution(op_id: str):
