@@ -78,7 +78,7 @@ except Exception:
 from core.console import sanitize_for_rich
 import core.database.utils
 import signal
-from core.database.utils import add_log, schedule_coroutine
+from core.database.utils import add_log, schedule_coroutine, update_session_status
 
 def signal_handler(sig, frame):
     """Handle termination signals to ensure logs are saved via finally block."""
@@ -1166,11 +1166,26 @@ async def main():
     parser.add_argument("--mode", type=str, choices=["default", "linear", "react"], default="default", help="Execution mode: default (P-E-R), linear (linear task chain), react (single Executor loop)")
     parser.add_argument("--no-causal-graph", action="store_true", help="Disable causal graph reasoning (ablation study)")
 
+    # Preflight arguments
+    parser.add_argument("--check-env", action="store_true", help="Run preflight environment checks and exit")
+    parser.add_argument("--skip-preflight", action="store_true", help="Skip preflight checks on startup")
+
     args = parser.parse_args()
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
+
+    # Preflight environment checks
+    if args.check_env or not args.skip_preflight:
+        from core.preflight import run_env_check, print_preflight_report
+        checks = await run_env_check()
+        print_preflight_report(checks)
+        if args.check_env:
+            sys.exit(0 if all(c.passed for c in checks) else 1)
+        if not all(c.passed for c in checks):
+            console.print("[bold red]Preflight checks failed. Use --skip-preflight to bypass or --check-env to see details.[/bold red]")
+            sys.exit(1)
 
     goal = args.goal
     task_name = args.task_name
@@ -1191,6 +1206,53 @@ async def main():
 
     # Initialize Database
     await core.database.utils.init_db()
+
+    # Check for existing running or crashed sessions for resume
+    is_resuming = False
+    resume_session = None
+
+    try:
+        if args.op_id:
+            # Auto-resume if the specified op_id session is running or crashed
+            session_record = await core.database.utils.get_session(args.op_id)
+            if session_record and session_record.status in ("running", "crashed"):
+                resume_session = session_record
+                is_resuming = True
+                console.print(Panel(f"检测到会话 {args.op_id} 状态为 {session_record.status}，自动恢复执行...", title="自动恢复", style="bold blue"))
+            else:
+                # Do not reuse a non-resumable op_id for a new task
+                op_id = generate_task_id()
+                task_id = op_id
+                llm.op_id = op_id
+                console.print(Panel(f"指定的会话 {args.op_id} 不存在或不可恢复，已生成新会话ID: {op_id}", title="警告", style="bold yellow"))
+        else:
+            existing_sessions = await core.database.utils.get_sessions_by_statuses(["running", "crashed"])
+            if existing_sessions:
+                console.print(Panel("发现以下未完成的会话:", title="恢复提示", style="yellow"))
+                for idx_sess, sess in enumerate(existing_sessions, 1):
+                    status_color = "red" if sess.status == "crashed" else "yellow"
+                    console.print(f"  {idx_sess}. [{status_color}]{sess.status}[/] {sess.name or sess.id} (ID: {sess.id})")
+                console.print("输入编号恢复会话，或输入 n/N 开始新任务:", style="bold")
+                try:
+                    user_input = (await asyncio.to_thread(input, "> ")).strip()
+                    if user_input.lower() != 'n':
+                        selected_idx = int(user_input) - 1
+                        if 0 <= selected_idx < len(existing_sessions):
+                            resume_session = existing_sessions[selected_idx]
+                            is_resuming = True
+                            console.print(Panel(f"选择恢复会话: {resume_session.id}", style="green"))
+                except (ValueError, IndexError):
+                    console.print("无效输入，开始新任务。", style="yellow")
+    except Exception as e:
+        console.print(Panel(f"检查恢复会话时出错: {e}", style="yellow"))
+
+    if resume_session:
+        goal = resume_session.goal or goal
+        task_name = resume_session.name or task_name
+        op_id = resume_session.id
+        task_id = resume_session.name or op_id
+        llm.op_id = op_id
+        console.print(Panel(f"恢复会话: {task_name}\n目标: {goal}\n会话ID: {op_id}", title="恢复信息", style="bold green"))
 
     # Create custom models dict from command line args
     llm_models = {
@@ -1309,6 +1371,9 @@ async def main():
         # Start the event consumer NOW that op_id is properly set
         asyncio.create_task(event_consumer(op_id))
 
+        # Initialize crash recovery flag before anything that could crash
+        crashed = False
+
         # Web Server Decoupling Warning
         if args.web:
             web_url = f"http://{DEFAULT_WEB_HOST}:{args.web_port}/?op_id={op_id}"
@@ -1330,16 +1395,24 @@ async def main():
             return
 
         # Initialize GraphManager
-        graph_manager = GraphManager(task_name, goal, op_id=op_id)
-        
-        # Update session status to running immediately after GraphManager is ready
-        try:
-            from core.database.utils import update_session_status
-            await update_session_status(op_id, "running")
-            console.print(Panel(f"Session {op_id} 状态已更新到数据库: running", style="green"))
-        except Exception as e:
-            console.print(Panel(f"更新数据库状态失败: {e}", style="yellow"))
-        
+        if is_resuming:
+            console.print(Panel(f"从数据库恢复会话 {op_id} 的图谱状态...", title="恢复执行", style="bold blue"))
+            graph_manager = await GraphManager.load_from_db(op_id)
+            try:
+                await update_session_status(op_id, "running")
+                console.print(Panel(f"Session {op_id} 状态已更新到数据库: running", style="green"))
+            except Exception as e:
+                console.print(Panel(f"更新数据库状态失败: {e}", style="yellow"))
+        else:
+            graph_manager = GraphManager(task_name, goal, op_id=op_id)
+            # Update session status to running immediately after GraphManager is ready
+            try:
+                from core.database.utils import update_session_status
+                await update_session_status(op_id, "running")
+                console.print(Panel(f"Session {op_id} 状态已更新到数据库: running", style="green"))
+            except Exception as e:
+                console.print(Panel(f"更新数据库状态失败: {e}", style="yellow"))
+
         # Record deployment time (considered complete upon GraphManager initialization)
         metrics["deployment_time"] = time.time() - metrics["start_time"]
         
@@ -1373,535 +1446,561 @@ async def main():
             pass
         global_mission_briefing = "任务的初始目标是：" + goal # Initialize global mission briefing
 
-        # 1. Planning (Plan)
-        console.print(Panel("进入规划阶段...", title="Planner", style="bold blue"))
-
-        try:
-            causal_graph_summary = graph_manager.get_causal_graph_summary()
-            initial_ops, call_metrics = await planner.plan(goal, causal_graph_summary)
-        except Exception as e:
-            console.print(Panel(f"规划阶段出现错误: {escape(str(e))}", title="Planner Error", style="bold red"))
-            import traceback
-            console.print(escape(traceback.format_exc()))
-            # Update session status to failed
+        if not is_resuming:
+            # 1. Planning (Plan)
+            console.print(Panel("进入规划阶段...", title="Planner", style="bold blue"))
+    
             try:
-                await update_session_status(op_id, "failed")
-            except Exception:
-                pass
-            raise
-        # Increment plan steps
-        if call_metrics:
-            call_metrics["plan_steps"] = call_metrics.get("plan_steps", 0) + 1
-        else:
-            call_metrics = {"plan_steps": 1}
-        update_global_metrics(metrics, call_metrics)
-        run_log.append({"event": "initial_plan", "data": initial_ops, "metrics": call_metrics, "timestamp": time.time()})
-        try:
-            await broker.emit("graph.changed", {"reason": "initial_plan_applied"}, op_id=llm.op_id)
-        except Exception:
-            pass
-
-        # HITL: Initial plan approval
-        if HUMAN_IN_THE_LOOP:
-            op_id = llm.op_id
-            
-            # Notify frontend of pending approval request
-            try:
-                await broker.emit("intervention.required", {"op_id": op_id, "type": "plan_approval"}, op_id=op_id)
-            except Exception:
-                pass
-            
-            # Start CLI interaction task (competes with Web端)
-            cli_task = asyncio.create_task(handle_cli_approval(op_id, initial_ops))
-                
-            # Block until decision is made (unblocks when either side submits)
-            decision = await intervention_manager.request_approval(op_id, initial_ops)
-            
-            # Clean up CLI task
-            if not cli_task.done():
-                cli_task.cancel()
-                try:
-                    await cli_task
-                except asyncio.CancelledError:
-                    pass
-            
-            action = decision.get("action")
-            if action == "REJECT":
-                console.print("[HITL] 用户拒绝了初始计划。任务终止。", style="bold red")
-                return # Exit task
-            elif action == "MODIFY":
-                initial_ops = decision.get("data", [])
-                console.print("[HITL] 用户修改了初始计划，应用修改后的操作。", style="bold green")
-            else:
-                console.print("[HITL] 用户批准了初始计划。", style="bold green")
-
-        verified_ops = verify_and_handle_orphans(initial_ops, graph_manager, console)
-        process_graph_commands(verified_ops, graph_manager)
-
-        # Get next tasks to execute for highlighting
-        next_executable_tasks = get_next_executable_subtask_batch(graph_manager)
-
-        if effective_output_mode in ["default", "debug"]:
-            console.print("初始计划已生成:")
-        if effective_output_mode in ["simple", "default", "debug"]:
-            graph_manager.print_graph_structure(console, highlight_nodes=next_executable_tasks)
-        if effective_output_mode in ["default", "debug"]:
-            # Output initial causal graph structure for debugging and visualization
-            try:
-                graph_manager.print_causal_graph(console, max_nodes=100)
+                causal_graph_summary = graph_manager.get_causal_graph_summary()
+                initial_ops, call_metrics = await planner.plan(goal, causal_graph_summary)
             except Exception as e:
-                console.print(Panel(f"打印因果图失败: {e}", title="因果图错误", style="red"))
-        run_log.append({"event": "initial_plan_generated", "plan": initial_ops, "timestamp": time.time()})
+                console.print(Panel(f"规划阶段出现错误: {escape(str(e))}", title="Planner Error", style="bold red"))
+                import traceback
+                console.print(escape(traceback.format_exc()))
+                # Update session status to failed
+                try:
+                    await update_session_status(op_id, "failed")
+                except Exception:
+                    pass
+                raise
+            # Increment plan steps
+            if call_metrics:
+                call_metrics["plan_steps"] = call_metrics.get("plan_steps", 0) + 1
+            else:
+                call_metrics = {"plan_steps": 1}
+            update_global_metrics(metrics, call_metrics)
+            run_log.append({"event": "initial_plan", "data": initial_ops, "metrics": call_metrics, "timestamp": time.time()})
+            try:
+                await broker.emit("graph.changed", {"reason": "initial_plan_applied"}, op_id=llm.op_id)
+            except Exception:
+                pass
+    
+            # HITL: Initial plan approval
+            if HUMAN_IN_THE_LOOP:
+                op_id = llm.op_id
+                
+                # Notify frontend of pending approval request
+                try:
+                    await broker.emit("intervention.required", {"op_id": op_id, "type": "plan_approval"}, op_id=op_id)
+                except Exception:
+                    pass
+                
+                # Start CLI interaction task (competes with Web端)
+                cli_task = asyncio.create_task(handle_cli_approval(op_id, initial_ops))
+                    
+                # Block until decision is made (unblocks when either side submits)
+                decision = await intervention_manager.request_approval(op_id, initial_ops)
+                
+                # Clean up CLI task
+                if not cli_task.done():
+                    cli_task.cancel()
+                    try:
+                        await cli_task
+                    except asyncio.CancelledError:
+                        pass
+                
+                action = decision.get("action")
+                if action == "REJECT":
+                    console.print("[HITL] 用户拒绝了初始计划。任务终止。", style="bold red")
+                    return # Exit task
+                elif action == "MODIFY":
+                    initial_ops = decision.get("data", [])
+                    console.print("[HITL] 用户修改了初始计划，应用修改后的操作。", style="bold green")
+                else:
+                    console.print("[HITL] 用户批准了初始计划。", style="bold green")
+    
+            verified_ops = verify_and_handle_orphans(initial_ops, graph_manager, console)
+            process_graph_commands(verified_ops, graph_manager)
+    
+            # Get next tasks to execute for highlighting
+            next_executable_tasks = get_next_executable_subtask_batch(graph_manager)
+    
+            if effective_output_mode in ["default", "debug"]:
+                console.print("初始计划已生成:")
+            if effective_output_mode in ["simple", "default", "debug"]:
+                graph_manager.print_graph_structure(console, highlight_nodes=next_executable_tasks)
+            if effective_output_mode in ["default", "debug"]:
+                # Output initial causal graph structure for debugging and visualization
+                try:
+                    graph_manager.print_causal_graph(console, max_nodes=100)
+                except Exception as e:
+                    console.print(Panel(f"打印因果图失败: {e}", title="因果图错误", style="red"))
+            run_log.append({"event": "initial_plan_generated", "plan": initial_ops, "timestamp": time.time()})
+        else:
+            console.print(Panel("跳过初始规划阶段，直接从数据库恢复的图谱状态继续执行...", title="恢复执行", style="bold blue"))
+            run_log.append({"event": "resumed_from_db", "session_id": op_id, "timestamp": time.time()})
 
         # 3. Execute-Reflect-Plan Loop
         completed_reflections = {} # Collect completed reflection outputs (including intelligence_summary)
         global_cycle_count = 0
         while True:
-            # --- Resource Governance Check ---
-            global_cycle_count += 1
-            if global_cycle_count > GLOBAL_MAX_CYCLES:
-                console.print(Panel(f"达到全局最大循环次数限制 ({GLOBAL_MAX_CYCLES})。任务强制终止以防止死循环。", title="资源熔断", style="bold red"))
-                metrics["success"] = False
-                metrics["termination_reason"] = "global_max_cycles_exceeded"
-                break
-            
-            if metrics.get("total_tokens", 0) > GLOBAL_MAX_TOKEN_USAGE:
-                console.print(Panel(f"达到全局最大 Token 消耗限制 ({GLOBAL_MAX_TOKEN_USAGE})。任务强制终止。", title="资源熔断", style="bold red"))
-                metrics["success"] = False
-                metrics["termination_reason"] = "global_token_limit_exceeded"
-                break
-            # ---------------------------------
-
-            # ==================================================
-            # 1. Planning Phase (PLAN)
-            # ==================================================
-            if completed_reflections:
-                if effective_output_mode in ["default", "debug"]:
-                    console.print(Panel("汇总情报，Planner 进行战略规划...", style="yellow"))
-
-                intelligence_summary = _aggregate_intelligence(completed_reflections)
-
-                refreshed_summary = graph_manager.get_full_graph_summary(detail_level=1)
-                causal_graph_summary = graph_manager.get_causal_graph_summary()
-                failure_patterns_summary = graph_manager.analyze_failure_patterns()
-
-                plan_data, call_metrics = await planner.dynamic_plan(
-                    goal, refreshed_summary, intelligence_summary,
-                    causal_graph_summary, "", failure_patterns_summary, graph_manager,
-                    planner_context=planner_context
-                )
-                # Output planner's dynamic plan results
-                if effective_output_mode in ["default", "debug"]:
-                    console.print(Panel("Planner 生成的动态计划:", title="动态计划", style="cyan"))
-                    # Sanitize JSON output to prevent issues with special characters in Rich parsing
-                    safe_plan_json = sanitize_for_rich(json.dumps(plan_data, indent=2, ensure_ascii=False))
-                    console.print(Panel(safe_plan_json, style="cyan"))
-                # Increment plan steps
-                if call_metrics:
-                    call_metrics["plan_steps"] = call_metrics.get("plan_steps", 0) + 1
-                else:
-                    call_metrics = {"plan_steps": 1}
-                update_global_metrics(metrics, call_metrics)
-                run_log.append({"event": "dynamic_plan", "data": plan_data, "metrics": call_metrics, "timestamp": time.time()})
-
-                # Check if Planner has declared the task accomplished
-                if plan_data.get("global_mission_accomplished"):
-                    console.print(Panel("🎉 Planner已宣布全局任务目标达成！任务结束。", title="[bold green]任务完成[/bold green]"))
-                    metrics["success_info"] = {"found": True, "reason": "Global mission accomplished signal received from Planner."}
-                    
-                    # 标记导致成功的节点（分层策略）
-                    # 1. 从 Planner 获取成功子任务 ID
-                    # 2. 从子任务节点读取 Reflector 标记的 critical_success_step_id
-                    # 3. 回退：如果没有标记，使用该子任务下最后完成的步骤
-                    
-                    goal_subtask_id = None
-                    goal_step_id = None
-                    
-                    # Step 1: 获取成功子任务 ID
-                    goal_achieved_by = plan_data.get("goal_achieved_by")
-                    if goal_achieved_by and graph_manager.graph.has_node(goal_achieved_by):
-                        goal_subtask_id = goal_achieved_by
-                        console.print(Panel(f"Planner 指定成功子任务: {goal_subtask_id}", style="blue"))
-                    elif completed_reflections:
-                        # 回退：从最近完成的反思中找子任务
-                        # 优先找 GOAL_ACHIEVED 状态的子任务
-                        for subtask_id, reflection_data in completed_reflections.items():
-                            audit = reflection_data.get("audit_result", {})
-                            if _is_goal_achieved_status(audit.get("status")):
-                                goal_subtask_id = subtask_id
-                                console.print(Panel(f"找到 goal_achieved 子任务: {goal_subtask_id}", style="blue"))
-                                break
+            try:
+                # --- Resource Governance Check ---
+                global_cycle_count += 1
+                if global_cycle_count > GLOBAL_MAX_CYCLES:
+                    console.print(Panel(f"达到全局最大循环次数限制 ({GLOBAL_MAX_CYCLES})。任务强制终止以防止死循环。", title="资源熔断", style="bold red"))
+                    metrics["success"] = False
+                    metrics["termination_reason"] = "global_max_cycles_exceeded"
+                    break
+                
+                if metrics.get("total_tokens", 0) > GLOBAL_MAX_TOKEN_USAGE:
+                    console.print(Panel(f"达到全局最大 Token 消耗限制 ({GLOBAL_MAX_TOKEN_USAGE})。任务强制终止。", title="资源熔断", style="bold red"))
+                    metrics["success"] = False
+                    metrics["termination_reason"] = "global_token_limit_exceeded"
+                    break
+                # ---------------------------------
+    
+                # ==================================================
+                # 1. Planning Phase (PLAN)
+                # ==================================================
+                if completed_reflections:
+                    if effective_output_mode in ["default", "debug"]:
+                        console.print(Panel("汇总情报，Planner 进行战略规划...", style="yellow"))
+    
+                    intelligence_summary = _aggregate_intelligence(completed_reflections)
+    
+                    refreshed_summary = graph_manager.get_full_graph_summary(detail_level=1)
+                    causal_graph_summary = graph_manager.get_causal_graph_summary()
+                    failure_patterns_summary = graph_manager.analyze_failure_patterns()
+    
+                    plan_data, call_metrics = await planner.dynamic_plan(
+                        goal, refreshed_summary, intelligence_summary,
+                        causal_graph_summary, "", failure_patterns_summary, graph_manager,
+                        planner_context=planner_context
+                    )
+                    # Output planner's dynamic plan results
+                    if effective_output_mode in ["default", "debug"]:
+                        console.print(Panel("Planner 生成的动态计划:", title="动态计划", style="cyan"))
+                        # Sanitize JSON output to prevent issues with special characters in Rich parsing
+                        safe_plan_json = sanitize_for_rich(json.dumps(plan_data, indent=2, ensure_ascii=False))
+                        console.print(Panel(safe_plan_json, style="cyan"))
+                    # Increment plan steps
+                    if call_metrics:
+                        call_metrics["plan_steps"] = call_metrics.get("plan_steps", 0) + 1
+                    else:
+                        call_metrics = {"plan_steps": 1}
+                    update_global_metrics(metrics, call_metrics)
+                    run_log.append({"event": "dynamic_plan", "data": plan_data, "metrics": call_metrics, "timestamp": time.time()})
+    
+                    # Check if Planner has declared the task accomplished
+                    if plan_data.get("global_mission_accomplished"):
+                        console.print(Panel("🎉 Planner已宣布全局任务目标达成！任务结束。", title="[bold green]任务完成[/bold green]"))
+                        metrics["success_info"] = {"found": True, "reason": "Global mission accomplished signal received from Planner."}
                         
-                        if not goal_subtask_id:
-                            # 再回退：最近完成的子任务
-                            sorted_reflections = sorted(
-                                completed_reflections.items(),
-                                key=lambda x: x[1].get('completed_at', 0) if isinstance(x[1], dict) else 0,
-                                reverse=True
-                            )
-                            if sorted_reflections:
-                                goal_subtask_id = sorted_reflections[0][0]
-                    
-                    if goal_subtask_id and graph_manager.graph.has_node(goal_subtask_id):
-                        subtask_data = graph_manager.graph.nodes[goal_subtask_id]
+                        # 标记导致成功的节点（分层策略）
+                        # 1. 从 Planner 获取成功子任务 ID
+                        # 2. 从子任务节点读取 Reflector 标记的 critical_success_step_id
+                        # 3. 回退：如果没有标记，使用该子任务下最后完成的步骤
                         
-                        # Step 2: 从子任务节点读取 Reflector 标记的 critical_success_step_id
-                        critical_step = subtask_data.get("critical_success_step_id")
-                        if critical_step and graph_manager.graph.has_node(critical_step):
-                            goal_step_id = critical_step
-                            console.print(Panel(f"Reflector 标记的关键成功步骤: {goal_step_id}", style="green"))
-                        else:
-                            # Step 3 回退: 找该子任务下最后完成的 execution_step
-                            last_step_id = None
-                            last_step_time = 0
+                        goal_subtask_id = None
+                        goal_step_id = None
+                        
+                        # Step 1: 获取成功子任务 ID
+                        goal_achieved_by = plan_data.get("goal_achieved_by")
+                        if goal_achieved_by and graph_manager.graph.has_node(goal_achieved_by):
+                            goal_subtask_id = goal_achieved_by
+                            console.print(Panel(f"Planner 指定成功子任务: {goal_subtask_id}", style="blue"))
+                        elif completed_reflections:
+                            # 回退：从最近完成的反思中找子任务
+                            # 优先找 GOAL_ACHIEVED 状态的子任务
+                            for subtask_id, reflection_data in completed_reflections.items():
+                                audit = reflection_data.get("audit_result", {})
+                                if _is_goal_achieved_status(audit.get("status")):
+                                    goal_subtask_id = subtask_id
+                                    console.print(Panel(f"找到 goal_achieved 子任务: {goal_subtask_id}", style="blue"))
+                                    break
                             
-                            for node_id in graph_manager.graph.nodes():
-                                node_data = graph_manager.graph.nodes[node_id]
-                                node_type = node_data.get("type", "")
-                                parent = node_data.get("parent", "")
+                            if not goal_subtask_id:
+                                # 再回退：最近完成的子任务
+                                sorted_reflections = sorted(
+                                    completed_reflections.items(),
+                                    key=lambda x: x[1].get('completed_at', 0) if isinstance(x[1], dict) else 0,
+                                    reverse=True
+                                )
+                                if sorted_reflections:
+                                    goal_subtask_id = sorted_reflections[0][0]
+                        
+                        if goal_subtask_id and graph_manager.graph.has_node(goal_subtask_id):
+                            subtask_data = graph_manager.graph.nodes[goal_subtask_id]
+                            
+                            # Step 2: 从子任务节点读取 Reflector 标记的 critical_success_step_id
+                            critical_step = subtask_data.get("critical_success_step_id")
+                            if critical_step and graph_manager.graph.has_node(critical_step):
+                                goal_step_id = critical_step
+                                console.print(Panel(f"Reflector 标记的关键成功步骤: {goal_step_id}", style="green"))
+                            else:
+                                # Step 3 回退: 找该子任务下最后完成的 execution_step
+                                last_step_id = None
+                                last_step_time = 0
                                 
-                                if node_type == "execution_step" and parent == goal_subtask_id:
-                                    if node_data.get("status") == "completed":
-                                        completed_at = node_data.get("completed_at", 0)
-                                        if completed_at and completed_at > last_step_time:
-                                            last_step_time = completed_at
-                                            last_step_id = node_id
+                                for node_id in graph_manager.graph.nodes():
+                                    node_data = graph_manager.graph.nodes[node_id]
+                                    node_type = node_data.get("type", "")
+                                    parent = node_data.get("parent", "")
+                                    
+                                    if node_type == "execution_step" and parent == goal_subtask_id:
+                                        if node_data.get("status") == "completed":
+                                            completed_at = node_data.get("completed_at", 0)
+                                            if completed_at and completed_at > last_step_time:
+                                                last_step_time = completed_at
+                                                last_step_id = node_id
+                                
+                                if last_step_id:
+                                    goal_step_id = last_step_id
+                                    console.print(Panel(f"回退：使用最后完成的步骤 {goal_step_id}", style="yellow"))
                             
-                            if last_step_id:
-                                goal_step_id = last_step_id
-                                console.print(Panel(f"回退：使用最后完成的步骤 {goal_step_id}", style="yellow"))
+                            # 标记成功节点
+                            if goal_step_id:
+                                graph_manager.update_node(goal_step_id, {"is_goal_achieved": True})
+                                console.print(Panel(f"✨ 执行步骤 {goal_step_id} 被标记为目标达成节点", style="green"))
+                            else:
+                                # 没找到 execution_step，标记子任务本身
+                                graph_manager.update_node(goal_subtask_id, {"is_goal_achieved": True})
+                                console.print(Panel(f"✨ 子任务 {goal_subtask_id} 被标记为目标达成节点", style="yellow"))
                         
-                        # 标记成功节点
-                        if goal_step_id:
-                            graph_manager.update_node(goal_step_id, {"is_goal_achieved": True})
-                            console.print(Panel(f"✨ 执行步骤 {goal_step_id} 被标记为目标达成节点", style="green"))
-                        else:
-                            # 没找到 execution_step，标记子任务本身
-                            graph_manager.update_node(goal_subtask_id, {"is_goal_achieved": True})
-                            console.print(Panel(f"✨ 子任务 {goal_subtask_id} 被标记为目标达成节点", style="yellow"))
-                    
-                    # Process final graph operations (if any)
-                    dynamic_ops = plan_data.get('graph_operations', [])
-                    if dynamic_ops:
-                        process_graph_commands(dynamic_ops, graph_manager)
-                    
-                    # Critical fix: Update root node status to completed
-                    graph_manager.update_node(graph_manager.task_id, {"status": "completed"})
-                    console.print(Panel(f"根任务 {graph_manager.task_id} 状态已更新为 completed", style="green"))
-                    
-                    # Update session status to completed in database
-                    try:
-                        from core.database.utils import update_session_status
-                        await update_session_status(llm.op_id, "completed")
-                        console.print(Panel(f"Session {llm.op_id} 状态已更新到数据库: completed", style="green"))
-                    except Exception as e:
-                        console.print(Panel(f"更新数据库状态失败: {e}", style="red"))
-                    
-                    # Notify frontend of graph structure change
-                    try:
-                        await broker.emit("graph.changed", {"reason": "mission_accomplished"}, op_id=llm.op_id)
-                    except Exception:
-                        pass
-                    
-                    break # Exit main loop
-
-                # Update Planner context status (new) and save full LLM prompt/response
-                try:
-                    last_prompt = getattr(planner, "_last_dynamic_prompt", None)
-                    last_response_text = getattr(planner, "_last_dynamic_response", None)
-                except Exception:
-                    last_prompt, last_response_text = None, None
-                planner_context = planner.update_planner_context_after_planning(
-                    planner_context, plan_data, graph_manager, llm_prompt=last_prompt, llm_response=last_response_text
-                )
-
-                # Check and compress Planner context if needed
-                await compress_planner_context_if_needed(planner_context, llm, metrics=metrics)
-
-                dynamic_ops = plan_data.get('graph_operations', [])
-                global_mission_briefing = plan_data.get('global_mission_briefing', global_mission_briefing)
-
-                if dynamic_ops:
-                    # HITL: Dynamic plan approval
-                    if HUMAN_IN_THE_LOOP:
-                        op_id = llm.op_id
+                        # Process final graph operations (if any)
+                        dynamic_ops = plan_data.get('graph_operations', [])
+                        if dynamic_ops:
+                            process_graph_commands(dynamic_ops, graph_manager)
                         
+                        # Critical fix: Update root node status to completed
+                        graph_manager.update_node(graph_manager.task_id, {"status": "completed"})
+                        console.print(Panel(f"根任务 {graph_manager.task_id} 状态已更新为 completed", style="green"))
+                        
+                        # Update session status to completed in database
                         try:
-                            await broker.emit("intervention.required", {"op_id": op_id, "type": "plan_approval"}, op_id=op_id)
+                            from core.database.utils import update_session_status
+                            await update_session_status(llm.op_id, "completed")
+                            console.print(Panel(f"Session {llm.op_id} 状态已更新到数据库: completed", style="green"))
+                        except Exception as e:
+                            console.print(Panel(f"更新数据库状态失败: {e}", style="red"))
+                        
+                        # Notify frontend of graph structure change
+                        try:
+                            await broker.emit("graph.changed", {"reason": "mission_accomplished"}, op_id=llm.op_id)
                         except Exception:
                             pass
-                            
-                        # Start CLI interaction task
-                        cli_task = asyncio.create_task(handle_cli_approval(op_id, dynamic_ops))
                         
-                        # Block until decision is made
-                        decision = await intervention_manager.request_approval(op_id, dynamic_ops)
-                        
-                        # Clean up CLI task
-                        if not cli_task.done():
-                            cli_task.cancel()
-                            try:
-                                await cli_task
-                            except asyncio.CancelledError:
-                                pass
-                        
-                        action = decision.get("action")
-                        if action == "REJECT":
-                            console.print("[HITL] 用户拒绝了动态计划。跳过本次更新（可能导致停滞）。", style="bold red")
-                            dynamic_ops = [] # Clear operations, continue loop
-                        elif action == "MODIFY":
-                            dynamic_ops = decision.get("data", [])
-                            console.print("[HITL] 用户修改了动态计划。", style="bold green")
-                        else:
-                            console.print("[HITL] 用户批准了动态计划。", style="bold green")
-
-                    if effective_output_mode in ["default", "debug"]:
-                        console.print(Panel("Planner 基于情报做出规划决策，开始更新...", style="yellow"))
-                    verified_ops = verify_and_handle_orphans(dynamic_ops, graph_manager, console)
-                    process_graph_commands(verified_ops, graph_manager)
+                        break # Exit main loop
+    
+                    # Update Planner context status (new) and save full LLM prompt/response
                     try:
-                        await broker.emit("graph.changed", {"reason": "dynamic_plan_applied"}, op_id=llm.op_id)
+                        last_prompt = getattr(planner, "_last_dynamic_prompt", None)
+                        last_response_text = getattr(planner, "_last_dynamic_response", None)
                     except Exception:
-                        pass
-                    if effective_output_mode in ["default", "debug"]:
-                        console.print("主任务图更新完成:")
-                    if effective_output_mode in ["simple", "default", "debug"]:
-                        next_executable_tasks = get_next_executable_subtask_batch(graph_manager)
-                        graph_manager.print_graph_structure(console, highlight_nodes=next_executable_tasks)
-                    if effective_output_mode in ["default", "debug"]:
-                        # Synchronously output updated causal graph structure
+                        last_prompt, last_response_text = None, None
+                    planner_context = planner.update_planner_context_after_planning(
+                        planner_context, plan_data, graph_manager, llm_prompt=last_prompt, llm_response=last_response_text
+                    )
+    
+                    # Check and compress Planner context if needed
+                    await compress_planner_context_if_needed(planner_context, llm, metrics=metrics)
+    
+                    dynamic_ops = plan_data.get('graph_operations', [])
+                    global_mission_briefing = plan_data.get('global_mission_briefing', global_mission_briefing)
+    
+                    if dynamic_ops:
+                        # HITL: Dynamic plan approval
+                        if HUMAN_IN_THE_LOOP:
+                            op_id = llm.op_id
+                            
+                            try:
+                                await broker.emit("intervention.required", {"op_id": op_id, "type": "plan_approval"}, op_id=op_id)
+                            except Exception:
+                                pass
+                                
+                            # Start CLI interaction task
+                            cli_task = asyncio.create_task(handle_cli_approval(op_id, dynamic_ops))
+                            
+                            # Block until decision is made
+                            decision = await intervention_manager.request_approval(op_id, dynamic_ops)
+                            
+                            # Clean up CLI task
+                            if not cli_task.done():
+                                cli_task.cancel()
+                                try:
+                                    await cli_task
+                                except asyncio.CancelledError:
+                                    pass
+                            
+                            action = decision.get("action")
+                            if action == "REJECT":
+                                console.print("[HITL] 用户拒绝了动态计划。跳过本次更新（可能导致停滞）。", style="bold red")
+                                dynamic_ops = [] # Clear operations, continue loop
+                            elif action == "MODIFY":
+                                dynamic_ops = decision.get("data", [])
+                                console.print("[HITL] 用户修改了动态计划。", style="bold green")
+                            else:
+                                console.print("[HITL] 用户批准了动态计划。", style="bold green")
+    
+                        if effective_output_mode in ["default", "debug"]:
+                            console.print(Panel("Planner 基于情报做出规划决策，开始更新...", style="yellow"))
+                        verified_ops = verify_and_handle_orphans(dynamic_ops, graph_manager, console)
+                        process_graph_commands(verified_ops, graph_manager)
                         try:
-                            graph_manager.print_causal_graph(console, max_nodes=100)
-                        except Exception as e:
-                            console.print(Panel(f"打印因果图失败: {e}", title="因果图错误", style="red"))
-
-                # Periodically save logs after each full P-E-R cycle
+                            await broker.emit("graph.changed", {"reason": "dynamic_plan_applied"}, op_id=llm.op_id)
+                        except Exception:
+                            pass
+                        if effective_output_mode in ["default", "debug"]:
+                            console.print("主任务图更新完成:")
+                        if effective_output_mode in ["simple", "default", "debug"]:
+                            next_executable_tasks = get_next_executable_subtask_batch(graph_manager)
+                            graph_manager.print_graph_structure(console, highlight_nodes=next_executable_tasks)
+                        if effective_output_mode in ["default", "debug"]:
+                            # Synchronously output updated causal graph structure
+                            try:
+                                graph_manager.print_causal_graph(console, max_nodes=100)
+                            except Exception as e:
+                                console.print(Panel(f"打印因果图失败: {e}", title="因果图错误", style="red"))
+    
+                    # Periodically save logs after each full P-E-R cycle
+                    if effective_output_mode in ["default", "debug"]:
+                        console.print(Panel("Saving log snapshot...", style="dim"))
+                    metrics["artifacts_found"] = len(graph_manager.causal_graph.nodes)
+                    # Record causal graph nodes
+                    metrics["causal_graph_nodes"] = list(graph_manager.causal_graph.nodes(data=True))
+                    save_logs(log_dir, metrics, run_log)
+    
+                    completed_reflections = {}
+    
+    # ==================================================
+                # 2. Execution Phase (EXECUTE)
+    # ==================================================
+                subtask_batch = get_next_executable_subtask_batch(graph_manager)
+    
+                if not subtask_batch and not completed_reflections:
+                    if not graph_manager.is_goal_achieved():
+                        console.print(Panel("任务全局停滞，没有可执行的子任务，但目标未达成。强制启动最终规划...", title="全局停滞", style="bold red"))
+                        # Force a final replan cycle
+                        completed_reflections['__FORCE_REPLAN__'] = {
+                            "audit_result": {"status": "STALLED", "completion_check": "All tasks are blocked or completed, but the goal is not achieved."},
+                            "key_findings": ["Global task execution has stalled."],
+                            "validated_nodes": [],
+                            "insight": {"type": "stall_analysis", "description": "The agent is stuck. A new high-level plan is required to find an alternative path."}
+                        }
+                        continue
+                    else:
+                        # If goal is achieved, exit normally
+                        console.print(Panel("所有子任务已完成且目标已达成，任务结束。", title="任务完成", style="bold green"))
+                        break
+    
+                if not subtask_batch and not completed_reflections:
+                     console.print(Panel("最终规划未能产生新的可执行任务，代理已尽力，任务结束。",
+                                         title="最终决策", style="bold red"))
+                     break
+    
+                # Mark subtasks as in_progress visually
+                for subtask_id in subtask_batch:
+                    graph_manager.update_node(subtask_id, {"status": "in_progress"})
+    
+                validator = _create_validator()
+    
+                # Define real-time save callback shared by all parallel tasks
+                # Note: In parallel execution, this may cause transient metric flip-flops in logs,
+                # but ensures at least one active task's progress is visible.
+                def per_realtime_save(cycle_metrics: Dict = None):
+                    snapshot = copy.deepcopy(metrics)
+                    if cycle_metrics:
+                        update_global_metrics(snapshot, cycle_metrics)
+                    save_logs(log_dir, snapshot, run_log)
+    
+                tasks = [
+                    asyncio.create_task(run_executor_cycle(goal, subtask_id, llm, graph_manager,
+                        global_mission_briefing, log_dir=log_dir,
+                        save_callback=per_realtime_save,
+                        output_mode=effective_output_mode,
+                        max_steps=graph_manager.graph.nodes[subtask_id].get('max_steps'),
+                        validator=validator))
+                    for subtask_id in subtask_batch
+                ]
+                completed_results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # ==================================================
+                # 3. Reflection (REFLECT)
+    # ==================================================
+                for i, result_or_exc in enumerate(completed_results):
+                    subtask_id = subtask_batch[i]
+                    try:
+                        if isinstance(result_or_exc, Exception):
+                            raise result_or_exc
+    
+                        _, result_status, cycle_metrics = result_or_exc
+                        update_global_metrics(metrics, cycle_metrics)
+                        run_log.append({"event": "executor_cycle_completed", "subtask_id": subtask_id,
+                                        "status": result_status, "metrics": cycle_metrics, "timestamp": time.time()})
+    
+                        console.print(Panel(f"子任务 {subtask_id} 执行完毕，状态: {result_status}。开始即时反思...",
+                                            title="Executor", style="bold blue"))
+    
+                        if not graph_manager.graph.has_node(subtask_id):
+                            console.print(Panel(f"跳过已废弃/删除的子任务 {subtask_id} 的反思阶段。",
+                                                title="警告", style="yellow"))
+                            continue
+    
+                        subtask_data = graph_manager.graph.nodes[subtask_id]
+                        reflection_output = await reflector.reflect(
+                            subtask_id=subtask_id,
+                            subtask_data=subtask_data,
+                            status=result_status,
+                            execution_log=graph_manager.get_subtask_execution_log(subtask_id),
+                            proposed_changes=subtask_data.get('proposed_changes', []),
+                            staged_causal_nodes=subtask_data.get('staged_causal_nodes', []),
+                            causal_graph_summary=graph_manager.get_causal_graph_summary(),
+                            dependency_context=graph_manager.build_prompt_context(
+                                subtask_id, include_relevant_causal_context=False
+                            ).get("dependencies", []),
+                            graph_manager=graph_manager,
+                            reflector_context=reflector_context
+                        )
+    
+                        update_global_metrics(metrics, reflection_output.get('metrics'))
+                        run_log.append({"event": "reflection_completed", "subtask_id": subtask_id, "data": reflection_output, "metrics": reflection_output.get('metrics'), "timestamp": time.time()})
+    
+                        # Update Reflector context status (new)
+                        reflector_context = update_reflector_context_after_reflection(
+                            reflector_context, reflection_output, subtask_id, result_status, graph_manager
+                        )
+    
+                        # Check and compress Reflector context if needed
+                        await compress_reflector_context_if_needed(reflector_context, llm, metrics=metrics)
+    
+                        # Output reflection_output
+                        if effective_output_mode in ["default", "debug"]:
+                            console.print(Panel("Reflector 输出:", title=f"子任务 {subtask_id} 反思结果", style="cyan"))
+                            # Create a copy for display, removing unnecessarily large fields
+                            display_output = {k: v for k, v in reflection_output.items() if k not in ['llm_reflection_prompt', 'llm_reflection_response']}
+                            # Sanitize JSON output to prevent issues with special characters in Rich parsing
+                            safe_reflection_json = sanitize_for_rich(json.dumps(display_output, indent=2, ensure_ascii=False))
+                            console.print(Panel(safe_reflection_json, style="cyan"))
+                        audit_result = reflection_output.get("audit_result", {})
+    
+                        # 保存 Reflector 标记的关键成功步骤到子任务节点
+                        critical_success_step = audit_result.get("critical_success_step_id")
+                        if critical_success_step and graph_manager.graph.has_node(critical_success_step):
+                            graph_manager.update_node(subtask_id, {"critical_success_step_id": critical_success_step})
+                            console.print(Panel(f"子任务 {subtask_id} 的关键成功步骤: {critical_success_step}", style="green"))
+    
+                        if audit_result.get("is_strategic_failure"):
+                            console.print(Panel(
+                                f"检测到子任务 {subtask_id} 的战略性失败（L4/L5），将由 Planner 统一制定替代方案。",
+                                title="⚠️ 战略失败", style="bold yellow"
+                            ))
+    
+                        # 所有反思结果统一汇入 completed_reflections，由 Global Planner 裁决
+                        completed_reflections[subtask_id] = reflection_output
+    
+                        causal_graph_updates = reflection_output.get("causal_graph_updates", {})
+                        if causal_graph_updates:
+                            validated_updates = validate_causal_graph_updates(causal_graph_updates,
+                                                                              graph_manager, subtask_id=subtask_id)
+                            process_causal_graph_commands(validated_updates, graph_manager, subtask_id=subtask_id)
+                            # Added causal graph print for simple mode requirement
+                            if effective_output_mode in ["simple", "default", "debug"]:
+                                try:
+                                    console.print(Panel(f"子任务 {subtask_id} 因果图更新:", title="因果图更新", style="green"))
+                                    graph_manager.print_causal_graph(console, max_nodes=100)
+                                except Exception as e:
+                                    console.print(Panel(f"打印因果图失败: {e}", title="因果图错误", style="red"))
+    
+                        # Process key facts
+                        key_facts = reflection_output.get("key_facts", [])
+                        if key_facts: # Key facts should always be printed, even in simple mode
+                            console.print(f"🔑 Reflector 提炼出 {len(key_facts)} 个关键事实", style="bold cyan")
+                            for fact in key_facts:
+                                if isinstance(fact, str) and fact.strip():
+                                    fact_id = graph_manager.add_key_fact(fact.strip())
+                                    console.print(f"  ✓ 关键事实已记录: {fact[:80]}{'...' if len(fact) > 80 else ''}", style="cyan")
+    
+                        subtask_audit_status = audit_result.get("status", "FAILED")
+                        # Convert to lowercase for consistent comparison
+                        status_lower = str(subtask_audit_status).lower()
+                        
+                        # Determine status: completed, incomplete, or failed
+                        if status_lower in ["completed", "pass", "goal_achieved"]:
+                            new_status = "completed"
+                        elif status_lower == "incomplete":
+                            new_status = "pending"
+                        else:
+                            new_status = "failed"
+    
+                        graph_manager.update_node(subtask_id, {"status": new_status,
+                                                               "summary": reflection_output.get("audit_result", {}).get("completion_check")})
+    
+                        # Clean up staged nodes after subtask completion (both completed and failed states require cleanup)
+                        if new_status in ["completed", "failed"]:
+                            graph_manager.clear_staged_causal_nodes(subtask_id)
+                        # Process causal graph nodes (validated nodes from Reflector)
+                        # new_nodes_for_exploration = reflection_output.get("causal_graph_updates", {}).get("nodes", [])
+                        # if new_nodes_for_exploration:
+                        #     graph_manager.update_exploration_state(new_nodes_for_exploration)
+    
+                        # Also process validated_nodes field (new data structure)
+                        # validated_nodes = reflection_output.get('validated_nodes', [])
+                        # if validated_nodes:
+                        #     graph_manager.update_exploration_state(validated_nodes)
+    
+                        # Save reflection report to Planner context for next planning cycle (new)
+                        planner_context.latest_reflection_report = reflection_output
+    
+                    except Exception as e:
+                        import traceback
+                        error_message = str(e)
+                        console.print(Panel(f"处理子任务 {escape(subtask_id)} 结果时发生严重错误: {escape(error_message)}\n{escape(traceback.format_exc())}", title="错误", style="bold red"))
+                        graph_manager.update_node(subtask_id, {'status': 'completed_error', 'summary': f"Critical error during reflection: {error_message}"})
+                        # Clean up staged nodes even if an error occurred
+                        graph_manager.clear_staged_causal_nodes(subtask_id)
+    
+                # Save logs after each batch of executor cycles and reflections
                 if effective_output_mode in ["default", "debug"]:
-                    console.print(Panel("Saving log snapshot...", style="dim"))
+                    console.print(Panel("Saving log snapshot after batch processing...", style="dim"))
                 metrics["artifacts_found"] = len(graph_manager.causal_graph.nodes)
                 # Record causal graph nodes
                 metrics["causal_graph_nodes"] = list(graph_manager.causal_graph.nodes(data=True))
                 save_logs(log_dir, metrics, run_log)
-
-                completed_reflections = {}
-
-# ==================================================
-            # 2. Execution Phase (EXECUTE)
-# ==================================================
-            subtask_batch = get_next_executable_subtask_batch(graph_manager)
-
-            if not subtask_batch and not completed_reflections:
-                if not graph_manager.is_goal_achieved():
-                    console.print(Panel("任务全局停滞，没有可执行的子任务，但目标未达成。强制启动最终规划...", title="全局停滞", style="bold red"))
-                    # Force a final replan cycle
-                    completed_reflections['__FORCE_REPLAN__'] = {
-                        "audit_result": {"status": "STALLED", "completion_check": "All tasks are blocked or completed, but the goal is not achieved."},
-                        "key_findings": ["Global task execution has stalled."],
-                        "validated_nodes": [],
-                        "insight": {"type": "stall_analysis", "description": "The agent is stuck. A new high-level plan is required to find an alternative path."}
-                    }
-                    continue
-                else:
-                    # If goal is achieved, exit normally
-                    console.print(Panel("所有子任务已完成且目标已达成，任务结束。", title="任务完成", style="bold green"))
-                    break
-
-            if not subtask_batch and not completed_reflections:
-                 console.print(Panel("最终规划未能产生新的可执行任务，代理已尽力，任务结束。",
-                                     title="最终决策", style="bold red"))
-                 break
-
-            # Mark subtasks as in_progress visually
-            for subtask_id in subtask_batch:
-                graph_manager.update_node(subtask_id, {"status": "in_progress"})
-
-            validator = _create_validator()
-
-            # Define real-time save callback shared by all parallel tasks
-            # Note: In parallel execution, this may cause transient metric flip-flops in logs,
-            # but ensures at least one active task's progress is visible.
-            def per_realtime_save(cycle_metrics: Dict = None):
-                snapshot = copy.deepcopy(metrics)
-                if cycle_metrics:
-                    update_global_metrics(snapshot, cycle_metrics)
-                save_logs(log_dir, snapshot, run_log)
-
-            tasks = [
-                asyncio.create_task(run_executor_cycle(goal, subtask_id, llm, graph_manager,
-                    global_mission_briefing, log_dir=log_dir,
-                    save_callback=per_realtime_save,
-                    output_mode=effective_output_mode,
-                    max_steps=graph_manager.graph.nodes[subtask_id].get('max_steps'),
-                    validator=validator))
-                for subtask_id in subtask_batch
-            ]
-            completed_results = await asyncio.gather(*tasks, return_exceptions=True)
-
-# ==================================================
-            # 3. Reflection (REFLECT)
-# ==================================================
-            for i, result_or_exc in enumerate(completed_results):
-                subtask_id = subtask_batch[i]
+    
+            except Exception as e:
+                crashed = True
+                crash_reason = str(e)
+                crash_timestamp = time.time()
+                console.print(Panel(f"Agent 发生未处理异常: {crash_reason}", title="异常熔断", style="bold red"))
+                import traceback
+                console.print(escape(traceback.format_exc()))
                 try:
-                    if isinstance(result_or_exc, Exception):
-                        raise result_or_exc
-
-                    _, result_status, cycle_metrics = result_or_exc
-                    update_global_metrics(metrics, cycle_metrics)
-                    run_log.append({"event": "executor_cycle_completed", "subtask_id": subtask_id,
-                                    "status": result_status, "metrics": cycle_metrics, "timestamp": time.time()})
-
-                    console.print(Panel(f"子任务 {subtask_id} 执行完毕，状态: {result_status}。开始即时反思...",
-                                        title="Executor", style="bold blue"))
-
-                    if not graph_manager.graph.has_node(subtask_id):
-                        console.print(Panel(f"跳过已废弃/删除的子任务 {subtask_id} 的反思阶段。",
-                                            title="警告", style="yellow"))
-                        continue
-
-                    subtask_data = graph_manager.graph.nodes[subtask_id]
-                    reflection_output = await reflector.reflect(
-                        subtask_id=subtask_id,
-                        subtask_data=subtask_data,
-                        status=result_status,
-                        execution_log=graph_manager.get_subtask_execution_log(subtask_id),
-                        proposed_changes=subtask_data.get('proposed_changes', []),
-                        staged_causal_nodes=subtask_data.get('staged_causal_nodes', []),
-                        causal_graph_summary=graph_manager.get_causal_graph_summary(),
-                        dependency_context=graph_manager.build_prompt_context(
-                            subtask_id, include_relevant_causal_context=False
-                        ).get("dependencies", []),
-                        graph_manager=graph_manager,
-                        reflector_context=reflector_context
-                    )
-
-                    update_global_metrics(metrics, reflection_output.get('metrics'))
-                    run_log.append({"event": "reflection_completed", "subtask_id": subtask_id, "data": reflection_output, "metrics": reflection_output.get('metrics'), "timestamp": time.time()})
-
-                    # Update Reflector context status (new)
-                    reflector_context = update_reflector_context_after_reflection(
-                        reflector_context, reflection_output, subtask_id, result_status, graph_manager
-                    )
-
-                    # Check and compress Reflector context if needed
-                    await compress_reflector_context_if_needed(reflector_context, llm, metrics=metrics)
-
-                    # Output reflection_output
-                    if effective_output_mode in ["default", "debug"]:
-                        console.print(Panel("Reflector 输出:", title=f"子任务 {subtask_id} 反思结果", style="cyan"))
-                        # Create a copy for display, removing unnecessarily large fields
-                        display_output = {k: v for k, v in reflection_output.items() if k not in ['llm_reflection_prompt', 'llm_reflection_response']}
-                        # Sanitize JSON output to prevent issues with special characters in Rich parsing
-                        safe_reflection_json = sanitize_for_rich(json.dumps(display_output, indent=2, ensure_ascii=False))
-                        console.print(Panel(safe_reflection_json, style="cyan"))
-                    audit_result = reflection_output.get("audit_result", {})
-
-                    # 保存 Reflector 标记的关键成功步骤到子任务节点
-                    critical_success_step = audit_result.get("critical_success_step_id")
-                    if critical_success_step and graph_manager.graph.has_node(critical_success_step):
-                        graph_manager.update_node(subtask_id, {"critical_success_step_id": critical_success_step})
-                        console.print(Panel(f"子任务 {subtask_id} 的关键成功步骤: {critical_success_step}", style="green"))
-
-                    if audit_result.get("is_strategic_failure"):
-                        console.print(Panel(
-                            f"检测到子任务 {subtask_id} 的战略性失败（L4/L5），将由 Planner 统一制定替代方案。",
-                            title="⚠️ 战略失败", style="bold yellow"
-                        ))
-
-                    # 所有反思结果统一汇入 completed_reflections，由 Global Planner 裁决
-                    completed_reflections[subtask_id] = reflection_output
-
-                    causal_graph_updates = reflection_output.get("causal_graph_updates", {})
-                    if causal_graph_updates:
-                        validated_updates = validate_causal_graph_updates(causal_graph_updates,
-                                                                          graph_manager, subtask_id=subtask_id)
-                        process_causal_graph_commands(validated_updates, graph_manager, subtask_id=subtask_id)
-                        # Added causal graph print for simple mode requirement
-                        if effective_output_mode in ["simple", "default", "debug"]:
-                            try:
-                                console.print(Panel(f"子任务 {subtask_id} 因果图更新:", title="因果图更新", style="green"))
-                                graph_manager.print_causal_graph(console, max_nodes=100)
-                            except Exception as e:
-                                console.print(Panel(f"打印因果图失败: {e}", title="因果图错误", style="red"))
-
-                    # Process key facts
-                    key_facts = reflection_output.get("key_facts", [])
-                    if key_facts: # Key facts should always be printed, even in simple mode
-                        console.print(f"🔑 Reflector 提炼出 {len(key_facts)} 个关键事实", style="bold cyan")
-                        for fact in key_facts:
-                            if isinstance(fact, str) and fact.strip():
-                                fact_id = graph_manager.add_key_fact(fact.strip())
-                                console.print(f"  ✓ 关键事实已记录: {fact[:80]}{'...' if len(fact) > 80 else ''}", style="cyan")
-
-                    subtask_audit_status = audit_result.get("status", "FAILED")
-                    # Convert to lowercase for consistent comparison
-                    status_lower = str(subtask_audit_status).lower()
-                    
-                    # Determine status: completed, incomplete, or failed
-                    if status_lower in ["completed", "pass", "goal_achieved"]:
-                        new_status = "completed"
-                    elif status_lower == "incomplete":
-                        new_status = "pending"
-                    else:
-                        new_status = "failed"
-
-                    graph_manager.update_node(subtask_id, {"status": new_status,
-                                                           "summary": reflection_output.get("audit_result", {}).get("completion_check")})
-
-                    # Clean up staged nodes after subtask completion (both completed and failed states require cleanup)
-                    if new_status in ["completed", "failed"]:
-                        graph_manager.clear_staged_causal_nodes(subtask_id)
-                    # Process causal graph nodes (validated nodes from Reflector)
-                    # new_nodes_for_exploration = reflection_output.get("causal_graph_updates", {}).get("nodes", [])
-                    # if new_nodes_for_exploration:
-                    #     graph_manager.update_exploration_state(new_nodes_for_exploration)
-
-                    # Also process validated_nodes field (new data structure)
-                    # validated_nodes = reflection_output.get('validated_nodes', [])
-                    # if validated_nodes:
-                    #     graph_manager.update_exploration_state(validated_nodes)
-
-                    # Save reflection report to Planner context for next planning cycle (new)
-                    planner_context.latest_reflection_report = reflection_output
-
-                except Exception as e:
-                    import traceback
-                    error_message = str(e)
-                    console.print(Panel(f"处理子任务 {escape(subtask_id)} 结果时发生严重错误: {escape(error_message)}\n{escape(traceback.format_exc())}", title="错误", style="bold red"))
-                    graph_manager.update_node(subtask_id, {'status': 'completed_error', 'summary': f"Critical error during reflection: {error_message}"})
-                    # Clean up staged nodes even if an error occurred
-                    graph_manager.clear_staged_causal_nodes(subtask_id)
-
-            # Save logs after each batch of executor cycles and reflections
-            if effective_output_mode in ["default", "debug"]:
-                console.print(Panel("Saving log snapshot after batch processing...", style="dim"))
-            metrics["artifacts_found"] = len(graph_manager.causal_graph.nodes)
-            # Record causal graph nodes
-            metrics["causal_graph_nodes"] = list(graph_manager.causal_graph.nodes(data=True))
-            save_logs(log_dir, metrics, run_log)
-
-        # 4. Final Archiving (executed after main loop)
-        console.print(Panel("任务完成，开始全局反思与归档...", title="全局反思", style="bold green"))
-        global_reflection = await reflector.reflect_global(graph_manager)
-
-        global_reflection_metrics = global_reflection.get('metrics')
-        # Increment global reflection steps
-        if global_reflection_metrics:
-            global_reflection_metrics["reflect_steps"] = global_reflection_metrics.get("reflect_steps", 0) + 1
-        else:
-            global_reflection_metrics = {"reflect_steps": 1}
-        update_global_metrics(metrics, global_reflection_metrics)
-        run_log.append({"event": "global_reflection_completed", "data": global_reflection, "metrics": global_reflection_metrics, "timestamp": time.time()})
-
-        # If web server is running, keep the process alive to allow for inspection.
-        if args.web:
-            console.print(Panel("任务执行完成。Web服务仍在运行中，按 [Ctrl+C] 退出。", title="任务结束", style="bold green"))
-            while True:
-                await asyncio.sleep(3600) # Sleep for a long time
-
+                    from core.database.utils import record_session_crash
+                    await record_session_crash(op_id, crash_reason, crash_timestamp)
+                except Exception as db_err:
+                    console.print(Panel(f"记录崩溃状态到数据库失败: {db_err}", style="red"))
+                break
+        if not crashed:
+            # 4. Final Archiving (executed after main loop)
+            console.print(Panel("任务完成，开始全局反思与归档...", title="全局反思", style="bold green"))
+            global_reflection = await reflector.reflect_global(graph_manager)
+    
+            global_reflection_metrics = global_reflection.get('metrics')
+            # Increment global reflection steps
+            if global_reflection_metrics:
+                global_reflection_metrics["reflect_steps"] = global_reflection_metrics.get("reflect_steps", 0) + 1
+            else:
+                global_reflection_metrics = {"reflect_steps": 1}
+            update_global_metrics(metrics, global_reflection_metrics)
+            run_log.append({"event": "global_reflection_completed", "data": global_reflection, "metrics": global_reflection_metrics, "timestamp": time.time()})
+    
+            # If web server is running, keep the process alive to allow for inspection.
+            if args.web:
+                console.print(Panel("任务执行完成。Web服务仍在运行中，按 [Ctrl+C] 退出。", title="任务结束", style="bold green"))
+                while True:
+                    await asyncio.sleep(3600) # Sleep for a long time
+    
     finally:
         if 'ks_manager' in locals():
             ks_manager.stop()
+
+        # Ensure DB status reflects crash if the P-E-R loop crashed
+        if 'crashed' in locals() and crashed:
+            try:
+                await update_session_status(op_id, "crashed")
+            except Exception:
+                pass
 
         # Ensure final logs are saved no matter what
         if 'graph_manager' in locals() and graph_manager:

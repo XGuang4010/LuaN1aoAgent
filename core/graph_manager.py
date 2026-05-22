@@ -58,7 +58,7 @@ class GraphManager:
     (支持 SQLite 持久化)
     """
 
-    def __init__(self, task_id: str, goal: str, op_id: Optional[str] = None):
+    def __init__(self, task_id: str, goal: str, op_id: Optional[str] = None, _skip_db_init: bool = False):
         self.task_id = task_id
         self.graph = nx.DiGraph()
         self.causal_graph = nx.DiGraph()
@@ -73,7 +73,7 @@ class GraphManager:
         self._shared_findings_read_cursors: Dict[str, int] = {}  # subtask_id -> 已读条数
         
         # Initialize session in DB if op_id is provided
-        if self.op_id:
+        if self.op_id and not _skip_db_init:
             schedule_coroutine(create_session(
                 session_id=self.op_id,
                 name=task_id,
@@ -81,7 +81,7 @@ class GraphManager:
                 config={}
             ))
             
-        self.initialize_graph(goal)
+        self.initialize_graph(goal, _skip_db_init=_skip_db_init)
 
     def set_op_id(self, op_id: str):
         """Set the operation ID for event emission and DB persistence."""
@@ -89,12 +89,12 @@ class GraphManager:
         # Note: We assume the session is created elsewhere if set late, 
         # or we could trigger a create_session here too if needed.
 
-    def initialize_graph(self, goal: str) -> None:
+    def initialize_graph(self, goal: str, _skip_db_init: bool = False) -> None:
         """初始化图，添加代表整体任务的根节点."""
         node_data = {"type": "task", "goal": goal, "status": "in_progress"}
         self.graph.add_node(self.task_id, **node_data)
         
-        if self.op_id:
+        if self.op_id and not _skip_db_init:
             schedule_coroutine(upsert_node(self.op_id, self.task_id, 'task', node_data))
 
     def _touch_causal_graph(self) -> None:
@@ -1950,3 +1950,56 @@ class GraphManager:
                 return True
 
         return False
+
+    @classmethod
+    async def load_from_db(cls, session_id: str) -> "GraphManager":
+        """
+        Reconstruct a GraphManager from database state.
+
+        Loads all nodes and edges for both task and causal graphs.
+        Note: executor conversation history and shared findings are not restored.
+        """
+        from sqlalchemy import select
+        from core.database.utils import AsyncSessionLocal, get_session_nodes, get_session_edges
+        from core.database.models import SessionModel
+
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                select(SessionModel).where(SessionModel.id == session_id)
+            )
+            session_record = result.scalar_one_or_none()
+            if not session_record:
+                raise GraphManagerError(f"Session {session_id} not found in database")
+
+        task_id = session_record.name or session_id
+        goal = session_record.goal or ""
+
+        # Create instance without triggering DB writes
+        gm = cls(task_id, goal, op_id=session_id, _skip_db_init=True)
+
+        # Rebuild task graph
+        task_nodes = await get_session_nodes(session_id, 'task')
+        for node in task_nodes:
+            gm.graph.add_node(node.node_id, **(node.data or {}))
+        task_edges = await get_session_edges(session_id, 'task')
+        for edge in task_edges:
+            gm.graph.add_edge(edge.source_node_id, edge.target_node_id, **(edge.data or {}))
+
+        # Rebuild causal graph
+        causal_nodes = await get_session_nodes(session_id, 'causal')
+        for node in causal_nodes:
+            gm.causal_graph.add_node(node.node_id, **(node.data or {}))
+        causal_edges = await get_session_edges(session_id, 'causal')
+        for edge in causal_edges:
+            gm.causal_graph.add_edge(edge.source_node_id, edge.target_node_id, **(edge.data or {}))
+
+        # Restore counters from loaded graph state
+        max_sequence = 0
+        for node in task_nodes:
+            data = node.data or {}
+            if data.get("type") == "execution_step":
+                max_sequence = max(max_sequence, data.get("sequence", 0))
+        gm._execution_counter = max_sequence
+        gm._causal_graph_version = len(causal_nodes)
+
+        return gm

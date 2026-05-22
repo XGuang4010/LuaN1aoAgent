@@ -424,3 +424,64 @@ def schedule_coroutine(coro):
     except RuntimeError:
         # No running loop (shouldn't happen in Agent execution, but safe fallback)
         pass
+
+
+async def get_session(session_id: str) -> Optional[SessionModel]:
+    """Get a session by ID."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(SessionModel).where(SessionModel.id == session_id)
+        )
+        return result.scalar_one_or_none()
+
+
+async def get_sessions_by_statuses(statuses: list[str]) -> list[SessionModel]:
+    """Get all sessions with any of the given statuses, ordered by updated_at desc."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(SessionModel)
+            .where(SessionModel.status.in_(statuses))
+            .order_by(SessionModel.updated_at.desc())
+        )
+        return result.scalars().all()
+
+
+async def get_session_nodes(session_id: str, graph_type: str) -> list[GraphNodeModel]:
+    """Get all graph nodes for a session."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(GraphNodeModel).where(
+                GraphNodeModel.session_id == session_id,
+                GraphNodeModel.graph_type == graph_type
+            )
+        )
+        return result.scalars().all()
+
+
+async def get_session_edges(session_id: str, graph_type: str) -> list[GraphEdgeModel]:
+    """Get all graph edges for a session."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(GraphEdgeModel).where(
+                GraphEdgeModel.session_id == session_id,
+                GraphEdgeModel.graph_type == graph_type
+            )
+        )
+        return result.scalars().all()
+
+
+async def record_session_crash(session_id: str, reason: str, timestamp: float) -> None:
+    """Record crash information in session config and update status to crashed."""
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(SessionModel).where(SessionModel.id == session_id)
+        )
+        sess = result.scalar_one_or_none()
+        if sess:
+            config = sess.config or {}
+            config["crash_reason"] = reason
+            config["crash_timestamp"] = timestamp
+            sess.config = config
+            sess.status = "crashed"
+            sess.updated_at = datetime.now()
+            await session.commit()
