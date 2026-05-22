@@ -45,6 +45,7 @@
 │
 ├── 功能增强层（Feature Enhancement）
 │   ├── 实时因果链动画（DAG 可视化升级）
+│   ├── DAG 节点重启与增量执行
 │   ├── 任务完成自动报告生成
 │   ├── 实时日志过滤与搜索（Web UI）
 │   ├── 启动向导（首次使用配置引导）
@@ -350,7 +351,199 @@ function drawCausalEdges(svg, causalEdges) {
 - [ ] 动画方向从 Evidence → Hypothesis → Vulnerability
 - [ ] 置信度越高，线条越粗、流速越快
 
-### 4.2 任务完成自动报告生成
+### 4.2 DAG 节点重启与增量执行
+
+**目标**：DAG 中的任意子任务（subtask）或执行步骤（step）节点失败后，用户可单独重启该节点，无需重新创建整个 `op_id` 大任务。已成功的上游节点成果保留，仅重置该节点及其下游节点。
+
+**现状问题**：
+- 当前 `subtask_1` 失败后，用户只能新建一个 `op_id` 重新执行全部探测
+- 已消耗 Token、时间和获取的上游情报全部浪费
+- 无单节点级状态重置机制
+
+**设计方案**：
+
+#### A. 节点状态重置（后端）
+
+```python
+# core/graph_manager.py
+class GraphManager:
+    def restart_node(self, node_id: str, cascade: bool = True) -> list[str]:
+        """重启指定节点，返回被重置的节点 ID 列表。
+        
+        Args:
+            node_id: 要重启的节点 ID（subtask 或 step）
+            cascade: 是否级联重置所有下游节点，默认 True
+        
+        Returns:
+            被重置的节点 ID 列表
+        """
+        reset_ids = [node_id]
+        
+        # 1. 重置自身状态
+        self.update_node(node_id, {
+            "status": "pending",
+            "observation": None,
+            "findings": [],
+            "errors": [],
+            "evidence_ids": [],
+            "observation_truncated": False,
+            "raw_output": "",
+            "completed_at": None,
+        })
+        
+        # 2. 从因果图中删除该节点产生的证据
+        evidence_ids = self.get_node_evidence_ids(node_id)
+        for ev_id in evidence_ids:
+            if self.causal_graph.has_node(ev_id):
+                self.causal_graph.remove_node(ev_id)
+        
+        # 3. 级联重置下游节点
+        if cascade:
+            downstream = self._get_downstream_nodes(node_id)
+            for down_id in downstream:
+                self.update_node(down_id, {
+                    "status": "pending",
+                    "observation": None,
+                    "findings": [],
+                    "errors": [],
+                    "evidence_ids": [],
+                    "completed_at": None,
+                })
+                reset_ids.append(down_id)
+        
+        # 4. 同步到数据库
+        for rid in reset_ids:
+            self._sync_node(rid, 'execution')
+        
+        return reset_ids
+    
+    def _get_downstream_nodes(self, node_id: str) -> list[str]:
+        """获取指定节点的所有下游节点（递归）。"""
+        downstream = []
+        for _, target in self.execution_graph.out_edges(node_id):
+            downstream.append(target)
+            downstream.extend(self._get_downstream_nodes(target))
+        return downstream
+```
+
+#### B. 增量执行模式（Agent 调度）
+
+当前 Agent 启动后执行所有 `pending` 节点，这天然支持增量执行。但需增加显式模式：
+
+```python
+# agent.py 主循环增强
+async def run_agent(args):
+    # ... 初始化 ...
+    
+    # 增量模式：只执行 pending 状态的节点
+    pending_nodes = graph_manager.get_nodes_by_status("pending")
+    if not pending_nodes:
+        logger.info("无 pending 节点，任务已完成")
+        return
+    
+    logger.info(f"发现 {len(pending_nodes)} 个 pending 节点，开始增量执行...")
+    
+    for node in pending_nodes:
+        # 跳过上游有 failed 节点的子任务（除非用户显式重启了上游）
+        if has_failed_upstream(node.id):
+            logger.warning(f"节点 {node.id} 上游存在失败节点，跳过执行")
+            continue
+        
+        await execute_node(node)
+```
+
+#### C. Web UI 交互
+
+```javascript
+// app.js: 节点右键菜单和详情面板
+function showNodeContextMenu(nodeId, event) {
+    const menu = document.createElement('div');
+    menu.className = 'node-context-menu';
+    menu.innerHTML = `
+        <button onclick="restartNode('${nodeId}', false)">仅重启此节点</button>
+        <button onclick="restartNode('${nodeId}', true)">重启此节点及下游</button>
+        <button onclick="viewNodeDetail('${nodeId}')">查看详情</button>
+    `;
+    document.body.appendChild(menu);
+}
+
+async function restartNode(nodeId, cascade) {
+    const confirmed = confirm(
+        cascade 
+            ? `确定重启节点 ${nodeId} 及其所有下游节点？上游成果将保留。`
+            : `确定仅重启节点 ${nodeId}？`
+    );
+    if (!confirmed) return;
+    
+    const resp = await fetch(`/api/node/${nodeId}/restart`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({cascade}),
+    });
+    const data = await resp.json();
+    
+    if (data.success) {
+        alert(`已重置 ${data.reset_count} 个节点，Agent 将自动重新执行`);
+        // 触发 SSE 刷新
+    } else {
+        alert(`重启失败: ${data.error}`);
+    }
+}
+```
+
+#### D. API 端点
+
+```python
+# web/server.py
+@app.post("/api/node/{node_id}/restart")
+async def restart_node(node_id: str, request: dict):
+    """重启指定 DAG 节点及其下游节点。"""
+    cascade = request.get("cascade", True)
+    graph_manager = get_graph_manager()
+    
+    if not graph_manager.has_node(node_id):
+        return {"success": False, "error": "Node not found"}
+    
+    node_status = graph_manager.get_node_status(node_id)
+    if node_status not in ["failed", "completed", "deprecated"]:
+        return {
+            "success": False, 
+            "error": f"Cannot restart node with status '{node_status}'. Only failed/completed/deprecated nodes can be restarted."
+        }
+    
+    reset_ids = graph_manager.restart_node(node_id, cascade=cascade)
+    
+    # 发送事件通知 Agent 有新的 pending 节点
+    await broker.emit("node.restarted", {
+        "node_id": node_id,
+        "reset_ids": reset_ids,
+        "cascade": cascade,
+    })
+    
+    return {
+        "success": True,
+        "reset_count": len(reset_ids),
+        "reset_ids": reset_ids,
+    }
+```
+
+**与断点续传的区别**：
+
+| 特性 | 断点续传 | 节点重启 |
+|------|----------|----------|
+| 触发方式 | 自动（进程崩溃后） | 手动（用户点击） |
+| 重置范围 | 整个任务状态 | 单节点及其下游 |
+| 使用场景 | 系统异常恢复 | 用户修正错误后重试 |
+| 上游数据 | 全部保留 | 全部保留 |
+
+**验收标准**：
+- [ ] 右键点击 DAG 节点显示「仅重启此节点」和「重启此节点及下游」选项
+- [ ] 重启后节点状态变为 `pending`，观察结果清空
+- [ ] 上游节点（已完成的兄弟/父节点）状态和数据不受影响
+- [ ] Agent 自动检测 pending 节点并执行，无需手动重启 Agent 进程
+- [ ] 级联重置正确计算所有下游节点（通过拓扑排序验证）
+
+### 4.3 任务完成自动报告生成
 
 **目标**：任务结束后自动生成结构化渗透测试报告（Markdown / HTML）。
 
@@ -391,7 +584,7 @@ class PentestReportGenerator:
 - [ ] 报告包含：目标指纹、发现列表、证据链、修复建议
 - [ ] 报告可被 Web UI 下载查看
 
-### 4.3 实时日志过滤与搜索（Web UI）
+### 4.4 实时日志过滤与搜索（Web UI）
 
 **目标**：右侧 `#llm-stream` 面板支持按关键词搜索和按事件类型过滤。
 
@@ -428,7 +621,7 @@ function renderLogEntry(event, data) {
 - [ ] 可按类型勾选显示/隐藏（如只看 executor 错误）
 - [ ] 过滤后支持导出当前视图
 
-### 4.4 启动向导
+### 4.5 启动向导
 
 **目标**：首次运行或配置不完整时，引导用户完成必要配置。
 
@@ -469,7 +662,7 @@ async def run_onboarding_wizard():
 - [ ] 配置自动写入 `.env` 文件
 - [ ] 向导结束后自动校验，全部通过才进入主界面
 
-### 4.5 任务模板库
+### 4.6 任务模板库
 
 **目标**：提供常见渗透测试场景的预设模板，用户一键选择即可开始。
 
@@ -497,7 +690,7 @@ async def run_onboarding_wizard():
 - [ ] 选择模板后 goal 和工具推荐自动填充
 - [ ] 用户可保存自定义模板
 
-### 4.6 假设验证追踪面板
+### 4.7 假设验证追踪面板
 
 **目标**：在 P3 详情面板中新增"假设"标签页，显示假设的置信度变化时间轴。
 
@@ -621,6 +814,7 @@ class Notifier:
 |--------|--------|----------|------|
 | P1 | 任务断点续传 | 4-5h | 异常后可恢复 |
 | P1 | 进程守护 | 2h | 服务稳定运行 |
+| P1 | DAG 节点重启与增量执行 | 4h | 避免重建整个任务 |
 | P1 | 实时日志过滤搜索 | 3h | 调试效率提升 |
 | P1 | 任务完成自动报告 | 4h | 交付物自动化 |
 
@@ -652,6 +846,7 @@ class Notifier:
 | `conf/task_templates.yaml` | 任务模板配置 |
 | `tests/core/test_checkpoint.py` | 断点续传测试 |
 | `tests/core/test_preflight.py` | 环境校验测试 |
+| `tests/core/test_restart_node.py` | 节点重启与级联重置测试 |
 
 ### 修改文件
 | 文件 | 改动 |
@@ -659,9 +854,9 @@ class Notifier:
 | `agent.py` | 主循环加 `try/except`，启动时调用 `preflight_check()`，结束时调用 `report_generator` |
 | `llm/llm_client.py` | 新增 `_probe_capabilities()`，修改 `chat_completion()` 自动降级 |
 | `core/executor.py` | 每周期结束调用 `save_checkpoint()` |
-| `core/graph_manager.py` | 新增 `export_state()` / `import_state()` |
-| `web/server.py` | 新增 `/api/report/{op_id}/download` 端点 |
-| `web/static/app.js` | 日志过滤、假设面板、多任务管理、因果链动画 |
+| `core/graph_manager.py` | 新增 `export_state()` / `import_state()`、`restart_node()` 方法 |
+| `web/server.py` | 新增 `/api/report/{op_id}/download`、`/api/node/{node_id}/restart` 端点 |
+| `web/static/app.js` | 日志过滤、假设面板、多任务管理、因果链动画、节点右键菜单（重启） |
 | `web/templates/index.html` | 新增过滤控件、向导模态框、响应式 CSS |
 
 ---
