@@ -80,6 +80,11 @@
     .causal-chain { display:flex; flex-direction:column; align-items:center; gap:4px; padding:12px; background:rgba(15,23,42,0.5); border-radius:6px; }
     .causal-chain-node { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-app); border:2px solid; border-radius:6px; min-width:140px; }
     .causal-chain-arrow { font-size:16px; color:var(--text-muted); line-height:1; }
+
+    /* ===== Node Context Menu ===== */
+    .node-context-menu { position:absolute; background:#fff; border:1px solid var(--border-color); border-radius:6px; padding:4px 0; box-shadow:0 4px 12px rgba(0,0,0,0.3); z-index:1000; min-width:160px; }
+    .node-context-item { padding:8px 16px; cursor:pointer; font-size:13px; color:var(--text-main); transition:background 0.15s; }
+    .node-context-item:hover { background:rgba(59,130,246,0.1); color:var(--accent-primary); }
   </style>
   <script src="/static/i18n.js?v=20241224"></script>
 </head>

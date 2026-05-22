@@ -909,7 +909,8 @@ function drawForceGraph(data) {
       const node = dagreGraph.node(d);
       return `translate(${node.x},${node.y})`;
     })
-    .on("click", (e, d) => showDetails(dagreGraph.node(d)));
+    .on("click", (e, d) => showDetails(dagreGraph.node(d)))
+    .on("contextmenu", (e, d) => showNodeContextMenu(d, e));
 
   // 节点背景 - 使用动态宽度和高度
   nodes.append("rect")
@@ -3215,4 +3216,91 @@ function toggleRightSidebar() {
       }
     }, 280);
   });
+}
+
+// ===== Node Context Menu & Restart =====
+
+function showNodeContextMenu(nodeId, event) {
+  event.preventDefault();
+  event.stopPropagation();
+
+  // 移除已有的上下文菜单
+  hideNodeContextMenu();
+
+  const menu = document.createElement('div');
+  menu.id = 'node-context-menu';
+  menu.className = 'node-context-menu';
+
+  const isZh = (window.currentLang || 'zh') === 'zh';
+
+  menu.innerHTML = `
+    <div class="node-context-item" onclick="restartNode('${nodeId}', false); hideNodeContextMenu();">
+      ${isZh ? '仅重启此节点' : 'Restart this node only'}
+    </div>
+    <div class="node-context-item" onclick="restartNode('${nodeId}', true); hideNodeContextMenu();">
+      ${isZh ? '重启此节点及下游' : 'Restart this node & downstream'}
+    </div>
+  `;
+
+  document.body.appendChild(menu);
+
+  // 定位菜单
+  const menuWidth = menu.offsetWidth || 160;
+  const menuHeight = menu.offsetHeight || 80;
+  let left = event.pageX;
+  let top = event.pageY;
+
+  if (left + menuWidth > window.innerWidth) {
+    left = window.innerWidth - menuWidth - 8;
+  }
+  if (top + menuHeight > window.innerHeight) {
+    top = window.innerHeight - menuHeight - 8;
+  }
+
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+
+  // 点击其他地方关闭菜单
+  setTimeout(() => {
+    document.addEventListener('click', hideNodeContextMenu, { once: true });
+  }, 10);
+}
+
+function hideNodeContextMenu() {
+  const menu = document.getElementById('node-context-menu');
+  if (menu) menu.remove();
+}
+
+async function restartNode(nodeId, cascade) {
+  if (!state.op_id) return;
+
+  const isZh = (window.currentLang || 'zh') === 'zh';
+  const ok = await showConfirmModal({
+    title: isZh ? '重启节点' : 'Restart Node',
+    message: isZh
+      ? `确定要重启节点 ${nodeId} 吗？${cascade ? '（包含下游节点）' : ''}`
+      : `Are you sure you want to restart node ${nodeId}? ${cascade ? '(including downstream)' : ''}`,
+    confirmText: isZh ? '重启' : 'Restart',
+    cancelText: isZh ? '取消' : 'Cancel',
+    danger: true
+  });
+  if (!ok) return;
+
+  try {
+    const r = await fetch(`/api/node/${nodeId}/restart?op_id=${state.op_id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cascade })
+    }).then(res => res.json());
+
+    if (r.success) {
+      console.log('Node restarted:', nodeId, 'reset_count:', r.reset_count, 'reset_ids:', r.reset_ids);
+      render(true);
+    } else {
+      alert(isZh ? '重启失败' : 'Restart failed');
+    }
+  } catch (e) {
+    console.error('Restart failed:', e);
+    alert(isZh ? `重启失败: ${e.message}` : `Restart failed: ${e.message}`);
+  }
 }

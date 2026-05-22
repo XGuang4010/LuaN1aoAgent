@@ -1951,6 +1951,106 @@ class GraphManager:
 
         return False
 
+    def _get_downstream_nodes(self, node_id: str) -> list[str]:
+        """使用 BFS（非递归）查找任务图中指定节点的所有下游节点。"""
+        if not self.graph.has_node(node_id):
+            return []
+
+        downstream: list[str] = []
+        visited: set[str] = set()
+        queue = [node_id]
+
+        while queue:
+            current = queue.pop(0)
+            for successor in self.graph.successors(current):
+                if successor not in visited:
+                    visited.add(successor)
+                    downstream.append(successor)
+                    queue.append(successor)
+
+        return downstream
+
+    def _remove_produced_evidence(self, node_id: str) -> None:
+        """从因果图中移除由指定节点（或其执行步骤）产生的证据节点。"""
+        if not self.op_id:
+            return
+
+        step_ids = {node_id}
+        if self.graph.has_node(node_id) and self.graph.nodes[node_id].get("type") == "subtask":
+            step_ids.update(self._collect_execution_steps(node_id))
+
+        evidence_ids_to_remove: set[str] = set()
+        for ev_id, ev_data in self.causal_graph.nodes(data=True):
+            if ev_data.get("node_type") != "Evidence":
+                continue
+            if ev_data.get("source_step_id") in step_ids:
+                evidence_ids_to_remove.add(ev_id)
+
+        for step_id in step_ids:
+            if not self.causal_graph.has_node(step_id):
+                continue
+            for successor in self.causal_graph.successors(step_id):
+                succ_data = self.causal_graph.nodes[successor]
+                if succ_data.get("node_type") == "Evidence":
+                    evidence_ids_to_remove.add(successor)
+
+        for ev_id in evidence_ids_to_remove:
+            if self.causal_graph.has_node(ev_id):
+                self.causal_graph.remove_node(ev_id)
+                schedule_coroutine(delete_node(self.op_id, ev_id, 'causal'))
+
+    def restart_node(self, node_id: str, cascade: bool = True) -> list[str]:
+        """重启指定节点（及可选的下游节点），重置状态并清理产物。"""
+        if not self.graph.has_node(node_id):
+            raise NodeNotFoundError(f"Node {node_id} not found in task graph")
+
+        reset_nodes: list[str] = [node_id]
+        self._reset_single_node(node_id)
+
+        if cascade:
+            downstream = self._get_downstream_nodes(node_id)
+            for nid in downstream:
+                self._reset_single_node(nid)
+            reset_nodes.extend(downstream)
+
+        return reset_nodes
+
+    def _reset_single_node(self, node_id: str) -> None:
+        """重置单个节点的执行状态并清理相关产物。"""
+        if not self.graph.has_node(node_id):
+            return
+
+        node_data = self.graph.nodes[node_id]
+        node_type = node_data.get("type")
+
+        node_data["status"] = "pending"
+        node_data["restarted_by_user"] = True
+        node_data["completed_at"] = None
+        node_data["updated_at"] = time.time()
+
+        for field in (
+            "observation", "findings", "errors", "evidence_ids",
+            "raw_output", "summary", "reflection", "critical_success_step_id",
+        ):
+            if field in node_data:
+                node_data[field] = [] if field in ("findings", "errors", "evidence_ids") else None
+
+        node_data["artifacts"] = []
+        if "staged_causal_nodes" in node_data:
+            node_data["staged_causal_nodes"] = []
+
+        if node_type == "subtask":
+            step_ids = self._collect_execution_steps(node_id)
+            for step_id in step_ids:
+                if self.graph.has_node(step_id):
+                    self.graph.remove_node(step_id)
+                    if self.op_id:
+                        schedule_coroutine(delete_node(self.op_id, step_id, 'task'))
+
+        self._remove_produced_evidence(node_id)
+        self._invalidate_execution_cache(node_id)
+        self._sync_node(node_id, 'task')
+
     @classmethod
     async def load_from_db(cls, session_id: str) -> "GraphManager":
         """

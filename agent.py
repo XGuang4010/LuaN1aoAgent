@@ -1103,6 +1103,8 @@ async def run_standalone_react(goal: str, task_name: str, log_dir: str, args: ar
     console.print(Panel("启动纯 ReAct 模式 (Ablation Mode C)...", style="bold magenta"))
     
     graph_manager = GraphManager(task_name, goal, op_id=op_id)
+    if register_graph:
+        register_graph(op_id, graph_manager)
     validator = _create_validator()
 
     # 将整个任务封装为一个可以直接执行的子任务
@@ -1454,6 +1456,8 @@ async def main():
         if is_resuming:
             console.print(Panel(f"从数据库恢复会话 {op_id} 的图谱状态...", title="恢复执行", style="bold blue"))
             graph_manager = await GraphManager.load_from_db(op_id)
+            if register_graph:
+                register_graph(op_id, graph_manager)
             try:
                 await update_session_status(op_id, "running")
                 console.print(Panel(f"Session {op_id} 状态已更新到数据库: running", style="green"))
@@ -1461,6 +1465,8 @@ async def main():
                 console.print(Panel(f"更新数据库状态失败: {e}", style="yellow"))
         else:
             graph_manager = GraphManager(task_name, goal, op_id=op_id)
+            if register_graph:
+                register_graph(op_id, graph_manager)
             # Update session status to running immediately after GraphManager is ready
             try:
                 from core.database.utils import update_session_status

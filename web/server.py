@@ -29,6 +29,12 @@ from core.database.utils import (
 from core.database.models import SessionModel, GraphNodeModel, GraphEdgeModel, EventLogModel, InterventionModel
 from core.intervention import intervention_manager # Added this line
 from conf.config import WEB_HOST, WEB_PORT
+from core.events import broker
+
+try:
+    from core.graph_manager import GraphManager
+except Exception:
+    GraphManager = None
 
 # 配置 SSE 日志
 _sse_logger = logging.getLogger("web.sse")
@@ -36,6 +42,9 @@ _sse_logger = logging.getLogger("web.sse")
 # 进程跟踪字典: {op_id -> subprocess.Popen}
 # 用于在终止任务时直接kill进程
 _running_processes: Dict[str, subprocess.Popen] = {}
+
+# 运行时 GraphManager 注册表（当 Agent 与 Web 服务同进程时可用）
+_graph_managers: Dict[str, Any] = {}
 
 WEB_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = WEB_DIR.parent
@@ -879,6 +888,65 @@ async def get_evidence_detail(evidence_id: str):
 @app.get("/api/evidence/{evidence_id}/chain")
 async def get_evidence_chain(evidence_id: str):
     return {"nodes": [{"id": evidence_id, "node_type": "Evidence"}], "edges": []}
+
+def register_graph(op_id: str, graph_manager: Any) -> None:
+    """注册运行时的 GraphManager 实例，使 Web 服务端点可直接操作图谱。"""
+    _graph_managers[op_id] = graph_manager
+
+
+class RestartNodePayload(BaseModel):
+    cascade: bool = True
+
+
+@app.post("/api/node/{node_id}/restart")
+async def api_node_restart(node_id: str, request: Request):
+    """重启指定节点（及可选的下游节点）。"""
+    op_id = request.query_params.get("op_id")
+    if not op_id:
+        raise HTTPException(status_code=400, detail="op_id is required")
+
+    body = await request.json()
+    cascade = body.get("cascade", True)
+
+    gm = _graph_managers.get(op_id)
+    if gm is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Agent process is not connected to the web server. Restart is unavailable."
+        )
+
+    if not gm.graph.has_node(node_id):
+        raise HTTPException(status_code=404, detail=f"Node {node_id} not found")
+
+    node_status = gm.graph.nodes[node_id].get("status")
+    if node_status not in ("failed", "completed", "deprecated"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Node status '{node_status}' is not restartable. Must be one of: failed, completed, deprecated"
+        )
+
+    try:
+        reset_ids = gm.restart_node(node_id, cascade=cascade)
+    except Exception as e:
+        _sse_logger.error(f"Failed to restart node {node_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Restart failed: {e}")
+
+    # 触发 broker 事件（如果可用）
+    try:
+        await broker.emit(
+            "node.restarted",
+            {"node_id": node_id, "cascade": cascade, "reset_ids": reset_ids},
+            op_id=op_id,
+        )
+    except Exception:
+        pass
+
+    return {
+        "success": True,
+        "reset_count": len(reset_ids),
+        "reset_ids": reset_ids,
+    }
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
