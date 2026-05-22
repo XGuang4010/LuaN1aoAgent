@@ -25,4 +25,5 @@ rich
 fastmcp
 mcp
 prompt_toolkit
+pyyaml
 plyer

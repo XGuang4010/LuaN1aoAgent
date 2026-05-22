@@ -15,12 +15,13 @@ import httpx
 class Notifier:
     """通用告警通知器."""
 
-    def __init__(self) -> None:
+    def __init__(self, test_mode: bool = False) -> None:
         self.webhook_url: Optional[str] = os.getenv("NOTIFIER_WEBHOOK_URL")
         self.notifier_type: str = os.getenv("NOTIFIER_TYPE", "webhook").lower()
         self._last_alert: Dict[Tuple[str, str], float] = {}
         self._default_task_id: Optional[str] = None
         self._default_dashboard_url: Optional[str] = None
+        self._test_mode = test_mode
 
     def set_task_context(self, task_id: str, dashboard_url: str) -> None:
         """设置当前任务的上下文信息."""
@@ -47,7 +48,7 @@ class Notifier:
 
         now = time.time()
         last_sent = self._last_alert.get(key, 0)
-        if now - last_sent < 300:  # 5 minutes cooldown
+        if not self._test_mode and now - last_sent < 300:  # 5 minutes cooldown
             return False
 
         self._last_alert[key] = now

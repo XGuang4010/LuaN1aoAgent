@@ -986,7 +986,7 @@ async def api_webhook_test():
     """测试告警通知配置是否正常工作."""
     from core.notifier import Notifier
 
-    notifier = Notifier()
+    notifier = Notifier(test_mode=True)
     try:
         ok = await notifier.send_alert(
             "info",

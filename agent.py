@@ -42,8 +42,6 @@ import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.live import Live
-from rich.status import Status
 from rich.markup import escape
 
 from core.console import set_console, init_console_with_file, console_proxy as console
@@ -55,7 +53,6 @@ from core.reflector import Reflector
 from core.executor import run_executor_cycle
 from core.data_contracts import PlannerContext, ReflectorContext
 from core.report_generator import PentestReportGenerator
-from tools import mcp_service
 from core.tool_manager import tool_manager
 from core.intervention import intervention_manager
 from core.checkpoint import save_checkpoint, load_latest_checkpoint
@@ -1264,31 +1261,6 @@ async def main():
             console.print(table)
         sys.exit(0)
 
-    if args.template:
-        templates = _load_templates()
-        template_map = {t.get("name", ""): t for t in templates}
-        selected = template_map.get(args.template)
-        if not selected:
-            available = ", ".join(f'"{n}"' for n in template_map if n)
-            console.print(f"[bold red]未找到模板: {args.template}[/bold red]")
-            console.print(f"[yellow]可用模板: {available or '无'}[/yellow]")
-            sys.exit(1)
-        if not args.goal:
-            console.print("[bold red]使用 --template 时必须提供 --goal 作为目标占位符 (例如: --goal example.com)[/bold red]")
-            sys.exit(1)
-        template_goal = selected.get("goal", "").replace("{target}", args.goal)
-        console.print(Panel(
-            f"[bold green]使用任务模板: {args.template}[/bold green]\n"
-            f"目标: {args.goal}\n"
-            f"推荐工具: {', '.join(selected.get('recommended_tools', []))}",
-            title="模板加载",
-            style="bold blue"
-        ))
-        args.goal = template_goal
-    elif not args.goal:
-        console.print("[bold red]错误: 必须提供 --goal 或使用 --template-list 查看模板。[/bold red]")
-        sys.exit(1)
-    # --------------------------------
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
@@ -1371,6 +1343,32 @@ async def main():
         task_id = resume_session.name or op_id
         llm.op_id = op_id
         console.print(Panel(f"恢复会话: {task_name}\n目标: {goal}\n会话ID: {op_id}", title="恢复信息", style="bold green"))
+
+    if not is_resuming and args.template:
+        templates = _load_templates()
+        template_map = {t.get("name", ""): t for t in templates}
+        selected = template_map.get(args.template)
+        if not selected:
+            available = ", ".join(f'"{n}"' for n in template_map if n)
+            console.print(f"[bold red]未找到模板: {args.template}[/bold red]")
+            console.print(f"[yellow]可用模板: {available or '无'}[/yellow]")
+            sys.exit(1)
+        if not args.goal:
+            console.print("[bold red]使用 --template 时必须提供 --goal 作为目标占位符 (例如: --goal example.com)[/bold red]")
+            sys.exit(1)
+        template_goal = selected.get("goal", "").replace("{target}", args.goal)
+        console.print(Panel(
+            f"[bold green]使用任务模板: {args.template}[/bold green]\n"
+            f"目标: {args.goal}\n"
+            f"推荐工具: {', '.join(selected.get('recommended_tools', []))}",
+            title="模板加载",
+            style="bold blue"
+        ))
+        args.goal = template_goal
+        goal = template_goal
+    elif not is_resuming and not args.goal:
+        console.print("[bold red]错误: 必须提供 --goal 或使用 --template-list 查看模板。[/bold red]")
+        sys.exit(1)
 
     # Create custom models dict from command line args
     llm_models = {
@@ -2018,7 +2016,7 @@ async def main():
                             console.print(Panel(f"子任务 {subtask_id} 的关键成功步骤: {critical_success_step}", style="green"))
                             try:
                                 await notifier.send_alert(
-                                    "warning",
+                                    "critical",
                                     f"Critical vulnerability found in {op_id}",
                                     f"Subtask {subtask_id} marked critical success step {critical_success_step}",
                                 )
