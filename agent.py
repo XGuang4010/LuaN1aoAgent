@@ -56,6 +56,7 @@ from core.report_generator import PentestReportGenerator
 from tools import mcp_service
 from core.tool_manager import tool_manager
 from core.intervention import intervention_manager
+from core.checkpoint import save_checkpoint, load_latest_checkpoint
 from conf.config import (
     PLANNER_HISTORY_WINDOW,
     REFLECTOR_HISTORY_WINDOW,
@@ -791,6 +792,43 @@ def update_reflector_context_after_reflection(reflector_context, reflection_outp
 
     return reflector_context
 
+def _build_checkpoint_context(graph_manager, completed_reflections: Dict[str, Dict[str, Any]], last_summary: str) -> dict:
+    """构建 checkpoint 上下文字典.
+
+    Args:
+        graph_manager: 图谱管理器实例.
+        completed_reflections: 已完成的反思结果.
+        last_summary: 上一轮循环的情报摘要字符串.
+
+    Returns:
+        符合 checkpoint 契约的上下文字典.
+    """
+    from networkx.readwrite import json_graph
+
+    observation_metadata = []
+    for subtask_id, reflection in completed_reflections.items():
+        audit = reflection.get("audit_result", {})
+        observation_metadata.append({
+            "subtask_id": subtask_id,
+            "status": audit.get("status", "UNKNOWN"),
+            "completion_check": audit.get("completion_check", ""),
+            "key_findings": reflection.get("key_findings", []),
+        })
+
+    graph_state = {
+        "task_id": graph_manager.task_id,
+        "graph": json_graph.node_link_data(graph_manager.graph),
+        "causal_graph": json_graph.node_link_data(graph_manager.causal_graph),
+        "shared_findings": graph_manager.shared_findings,
+    }
+
+    return {
+        "version": 1,
+        "graph_state": graph_state,
+        "last_summary": last_summary,
+        "observation_metadata": observation_metadata,
+    }
+
 def _extract_failure_pattern(audit_result, key_findings):
     """从审计结果和关键发现中提取失败模式"""
     status = audit_result.get('status', '')
@@ -936,6 +974,10 @@ def get_next_executable_subtask_batch(graph: GraphManager) -> List[str]:
     完成后所有子任务均会进入 Reflection 并更新状态；`in_progress` 仅在
     进程异常崩溃重启后可能残留，此时应在启动恢复逻辑中将其重置为 `pending`，
     而非在正常调度中重新入队（避免重复执行）。
+
+    增量执行支持：已完成节点自动跳过，仅调度 pending/ready/active 节点。
+    若上游存在 failed 节点，默认跳过该节点；但如该节点被用户显式重启
+    （restarted_by_user=True），则允许放行以便重试。
     """
     executable_tasks = []
     for node, data in graph.graph.nodes(data=True):
@@ -947,11 +989,24 @@ def get_next_executable_subtask_batch(graph: GraphManager) -> List[str]:
             u for u, v in graph.graph.in_edges(node)
             if graph.graph.edges[u, v].get('type') == 'dependency'
         ]
-        if all(
-            str(graph.graph.nodes[dep].get('status', '')).startswith(('completed', 'deprecated', 'failed'))
-            for dep in dependencies
-        ):
-            executable_tasks.append(node)
+        deps_satisfied = True
+        has_failed_upstream = False
+        for dep in dependencies:
+            dep_status = str(graph.graph.nodes[dep].get('status', ''))
+            if not dep_status.startswith(('completed', 'deprecated', 'failed')):
+                deps_satisfied = False
+                break
+            if dep_status.startswith('failed'):
+                has_failed_upstream = True
+
+        if not deps_satisfied:
+            continue
+
+        # 若上游存在 failed，仅当该节点被用户显式重启时才允许执行
+        if has_failed_upstream and not data.get('restarted_by_user'):
+            continue
+
+        executable_tasks.append(node)
 
     return executable_tasks
 
@@ -1447,6 +1502,15 @@ async def main():
             pass
         global_mission_briefing = "任务的初始目标是：" + goal # Initialize global mission briefing
 
+        # Checkpoint resume: restore last_summary into planner/reflector context if available
+        checkpoint = load_latest_checkpoint(op_id)
+        if checkpoint:
+            console.print(Panel(f"检测到 checkpoint (cycle {checkpoint.get('cycle_num', '?')})，恢复上下文摘要...", title="断点续传", style="bold green"))
+            last_summary = checkpoint.get("last_summary", "")
+            if last_summary:
+                planner_context.compressed_history_summary = last_summary
+                reflector_context.compressed_reflection_summary = last_summary
+
         if not is_resuming:
             # 1. Planning (Plan)
             console.print(Panel("进入规划阶段...", title="Planner", style="bold blue"))
@@ -1792,7 +1856,7 @@ async def main():
     
                 # Mark subtasks as in_progress visually
                 for subtask_id in subtask_batch:
-                    graph_manager.update_node(subtask_id, {"status": "in_progress"})
+                    graph_manager.update_node(subtask_id, {"status": "in_progress", "restarted_by_user": False})
     
                 validator = _create_validator()
     
@@ -1958,7 +2022,16 @@ async def main():
                 # Record causal graph nodes
                 metrics["causal_graph_nodes"] = list(graph_manager.causal_graph.nodes(data=True))
                 save_logs(log_dir, metrics, run_log)
-    
+
+                # Save checkpoint at the end of each P-E-R cycle (non-blocking)
+                if completed_reflections:
+                    intel_summary = _aggregate_intelligence(completed_reflections)
+                    last_summary_text = json.dumps(intel_summary, ensure_ascii=False)
+                else:
+                    last_summary_text = global_mission_briefing
+                checkpoint_ctx = _build_checkpoint_context(graph_manager, completed_reflections, last_summary_text)
+                asyncio.create_task(save_checkpoint(op_id, global_cycle_count, checkpoint_ctx))
+
             except Exception as e:
                 crashed = True
                 crash_reason = str(e)
@@ -1985,7 +2058,15 @@ async def main():
                 global_reflection_metrics = {"reflect_steps": 1}
             update_global_metrics(metrics, global_reflection_metrics)
             run_log.append({"event": "global_reflection_completed", "data": global_reflection, "metrics": global_reflection_metrics, "timestamp": time.time()})
-    
+
+            # 生成最终渗透测试报告
+            try:
+                report_gen = PentestReportGenerator(graph_manager, op_id, task_name, log_dir)
+                report_path = report_gen.generate()
+                console.print(Panel(f"报告已生成: {report_path}", title="报告"))
+            except Exception as e:
+                console.print(Panel(f"报告生成失败: {e}", title="报告错误", style="red"))
+
             # If web server is running, keep the process alive to allow for inspection.
             if args.web:
                 console.print(Panel("任务执行完成。Web服务仍在运行中，按 [Ctrl+C] 退出。", title="任务结束", style="bold green"))
