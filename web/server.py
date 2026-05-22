@@ -283,6 +283,7 @@ async def api_ops():
                 "task_id": s.name, # Using name as task_id roughly
                 "goal": s.goal,
                 "created_at": s.created_at.timestamp(),
+                "updated_at": s.updated_at.timestamp() if s.updated_at else None,
                 "log_dir": f"logs/{s.name}/{s.id}", # Approximation
                 "status": {
                     "raw": s.status,

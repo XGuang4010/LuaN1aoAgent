@@ -54,6 +54,7 @@ const i18n = {
     'status.deprecated': '已废弃',
     'status.running': '运行中',
     'status.mission_accomplished': '全局任务目标达成！',
+    'status.aborted': '已终止',
 
     // Node Types
     'type.root': '主任务',
@@ -175,6 +176,7 @@ const i18n = {
     'status.deprecated': 'Deprecated',
     'status.running': 'Running',
     'status.mission_accomplished': 'Global Mission Accomplished!',
+    'status.aborted': 'Aborted',
 
     // Node Types
     'type.root': 'Root Task',

@@ -213,6 +213,7 @@ window.addEventListener('resize', () => {
 });
 
 function checkMobileView() {
+  const wasMobile = state.isMobile;
   state.isMobile = window.innerWidth < 768;
   document.body.classList.toggle('mobile-view', state.isMobile);
 
@@ -221,6 +222,7 @@ function checkMobileView() {
   const controls = document.getElementById('controls');
   const legend = document.getElementById('legend');
   const details = document.getElementById('node-details-panel');
+  const rightPanel = document.getElementById('right-panel');
 
   if (state.isMobile) {
     if (dagSvg) dagSvg.style.display = 'none';
@@ -228,11 +230,19 @@ function checkMobileView() {
     if (controls) controls.style.display = 'none';
     if (legend) legend.style.display = 'none';
     if (details) details.classList.remove('show');
+    if (rightPanel) {
+      rightPanel.classList.add('collapsed');
+      rightPanel.classList.remove('expanded');
+    }
   } else {
     if (dagSvg) dagSvg.style.display = 'block';
     if (timeline) timeline.style.display = 'none';
     if (controls) controls.style.display = 'flex';
     if (legend) legend.style.display = 'block';
+    if (rightPanel) {
+      rightPanel.classList.remove('collapsed');
+      rightPanel.classList.remove('expanded');
+    }
   }
 }
 
@@ -245,8 +255,10 @@ function renderMobileTimeline(data) {
     return;
   }
 
+  // For exec view, show action/task nodes; for causal, show all causal nodes
+  const isExec = state.view === 'exec';
   const timelineNodes = data.nodes
-    .filter(n => n.type === 'action' || n.type === 'task')
+    .filter(n => isExec ? (n.type === 'action' || n.type === 'task') : true)
     .sort((a, b) => {
       const timeA = a.completed_at || a.created_at || 0;
       const timeB = b.completed_at || b.created_at || 0;
@@ -255,11 +267,13 @@ function renderMobileTimeline(data) {
 
   let h = '<div class="mobile-timeline-list">';
   timelineNodes.forEach(n => {
-    const statusColor = nodeColors[n.status] || '#64748b';
+    const statusColor = nodeColors[n.status] || nodeColors[n.node_type || n.type] || '#64748b';
     const statusIcon = n.status === 'completed' ? '✓' :
       n.status === 'failed' ? '✗' :
         n.status === 'in_progress' || n.status === 'running' ? '◉' : '○';
-    const toolName = n.tool_name || (n.type === 'task' ? (currentLang === 'zh' ? '子任务' : 'Task') : (currentLang === 'zh' ? '动作' : 'Action'));
+    const toolName = isExec
+      ? (n.tool_name || (n.type === 'task' ? (currentLang === 'zh' ? '子任务' : 'Task') : (currentLang === 'zh' ? '动作' : 'Action')))
+      : (n.node_type || n.type || 'Node');
     const findings = n.findings || (n.data && n.data.findings) || [];
     const findingsCount = Array.isArray(findings) ? findings.length : Object.keys(findings).length;
     const time = n.completed_at
@@ -291,7 +305,7 @@ function showDetailsFromTimeline(nodeId) {
 }
 
 function initMobileLogSheet() {
-  const sheet = document.getElementById('mobile-log-sheet');
+  const sheet = document.getElementById('right-panel');
   const handle = document.querySelector('.mobile-log-handle');
   if (!sheet || !handle) return;
 
@@ -309,11 +323,13 @@ function initMobileLogSheet() {
     if (sheet.classList.contains('expanded')) {
       if (deltaY > 50) {
         sheet.classList.remove('expanded');
+        sheet.classList.add('collapsed');
         isDragging = false;
       }
     } else {
       if (deltaY < -50) {
         sheet.classList.add('expanded');
+        sheet.classList.remove('collapsed');
         isDragging = false;
       }
     }
@@ -324,7 +340,13 @@ function initMobileLogSheet() {
   });
 
   handle.addEventListener('click', () => {
-    sheet.classList.toggle('expanded');
+    if (sheet.classList.contains('expanded')) {
+      sheet.classList.remove('expanded');
+      sheet.classList.add('collapsed');
+    } else {
+      sheet.classList.add('expanded');
+      sheet.classList.remove('collapsed');
+    }
   });
 }
 
@@ -399,7 +421,7 @@ async function loadOps() {
         progressClass = '';
       } else if (i.status.aborted) {
         statusColor = '#94a3b8';
-        statusLabel = currentLang === 'zh' ? '已终止' : 'Aborted';
+        statusLabel = t('status.aborted') || 'Aborted';
         progressPercent = 100;
         progressClass = '';
       } else {
@@ -686,7 +708,7 @@ async function render(force) {
 
     state._lastGraphData = data;
 
-    if (state.isMobile && state.view === 'exec') {
+    if (state.isMobile) {
       renderMobileTimeline(data);
     } else {
       drawForceGraph(data);
