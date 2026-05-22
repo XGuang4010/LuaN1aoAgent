@@ -59,6 +59,7 @@ from tools import mcp_service
 from core.tool_manager import tool_manager
 from core.intervention import intervention_manager
 from core.checkpoint import save_checkpoint, load_latest_checkpoint
+from core.notifier import Notifier
 from conf.config import (
     PLANNER_HISTORY_WINDOW,
     REFLECTOR_HISTORY_WINDOW,
@@ -1481,6 +1482,8 @@ async def main():
     # Ensure knowledge service is running
     await ensure_knowledge_service(console)
 
+    notifier = Notifier()
+
     try:
         # op_id already determined above
 
@@ -1501,6 +1504,10 @@ async def main():
                 style="bold green",
                 title="Web Visualization"
             ))
+        else:
+            web_url = f"http://{DEFAULT_WEB_HOST}:{DEFAULT_WEB_PORT}/?op_id={op_id}"
+
+        notifier.set_task_context(op_id, web_url)
 
         metrics["task_id"] = task_id
         console.print(Panel(f"Task: {escape(task_name)}\nTask ID: {escape(task_id)}\nGoal: {escape(goal)}", title="任务初始化", style="bold green"))
@@ -2009,6 +2016,14 @@ async def main():
                         if critical_success_step and graph_manager.graph.has_node(critical_success_step):
                             graph_manager.update_node(subtask_id, {"critical_success_step_id": critical_success_step})
                             console.print(Panel(f"子任务 {subtask_id} 的关键成功步骤: {critical_success_step}", style="green"))
+                            try:
+                                await notifier.send_alert(
+                                    "warning",
+                                    f"Critical vulnerability found in {op_id}",
+                                    f"Subtask {subtask_id} marked critical success step {critical_success_step}",
+                                )
+                            except Exception as alert_err:
+                                console.print(Panel(f"发送关键漏洞告警失败: {alert_err}", style="red"))
     
                         if audit_result.get("is_strategic_failure"):
                             console.print(Panel(
@@ -2109,6 +2124,14 @@ async def main():
                     await record_session_crash(op_id, crash_reason, crash_timestamp)
                 except Exception as db_err:
                     console.print(Panel(f"记录崩溃状态到数据库失败: {db_err}", style="red"))
+                try:
+                    await notifier.send_alert(
+                        "critical",
+                        f"Task {op_id} crashed",
+                        f"Reason: {crash_reason}",
+                    )
+                except Exception as alert_err:
+                    console.print(Panel(f"发送崩溃告警失败: {alert_err}", style="red"))
                 break
         if not crashed:
             # 4. Final Archiving (executed after main loop)

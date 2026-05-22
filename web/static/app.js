@@ -32,12 +32,13 @@ const causalColors = {
 const PHASE_BANNER_DEFAULT_BG = 'rgba(59, 130, 246, 0.95)';
 const PHASE_BANNER_SUCCESS_BG = 'linear-gradient(90deg, rgba(16, 185, 129, 0.9), rgba(5, 150, 105, 0.9))';
 const PHASE_BANNER_ABORTED_BG = 'rgba(239, 68, 68, 0.95)';
-let state = { op_id: new URLSearchParams(location.search).get('op_id') || '', view: 'exec', simulation: null, svg: null, g: null, zoom: null, es: null, processedEvents: new Set(), pendingReq: null, isModifyMode: false, currentPhase: null, missionAccomplished: false, isAborted: false, taskStatus: null, userHasInteracted: false, lastActiveNodeId: null, isProgrammaticZoom: false, renderDebounceTimer: null, lastRenderTime: 0, isLoadingHistory: false, collapsedNodes: new Set(), userExpandedNodes: new Set(), leftSidebarCollapsed: false, rightSidebarCollapsed: false };
+let state = { op_id: new URLSearchParams(location.search).get('op_id') || '', view: 'exec', simulation: null, svg: null, g: null, zoom: null, es: null, processedEvents: new Set(), pendingReq: null, isModifyMode: false, currentPhase: null, missionAccomplished: false, isAborted: false, taskStatus: null, userHasInteracted: false, lastActiveNodeId: null, isProgrammaticZoom: false, renderDebounceTimer: null, lastRenderTime: 0, isLoadingHistory: false, collapsedNodes: new Set(), userExpandedNodes: new Set(), leftSidebarCollapsed: false, rightSidebarCollapsed: false, taskFilter: 'all', isMobile: false, _lastGraphData: null };
 const api = (p, b) => fetch(p + (p.includes('?') ? '&' : '?') + `op_id=${state.op_id}`, b ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) } : {}).then(r => r.json());
 
 // Log filtering state
 const logFilters = { search: "", types: new Set(["executor", "planner", "reflector", "system"]) };
 let logSearchDebounceTimer = null;
+let opsRefreshDebounce = null;
 
 function getLogCategory(msg, roleName) {
   if (roleName && roleName !== 'SYSTEM') {

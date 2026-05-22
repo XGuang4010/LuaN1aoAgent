@@ -14,7 +14,12 @@ const i18n = {
     'btn.stop': '终止',
 
     // Sidebar
-    'sidebar.operations': '操作列表',
+    // Dashboard Filters
+    'filter.all': '全部',
+    'filter.running': '运行中',
+    'filter.completed': '已完成',
+    'filter.crashed': '崩溃',
+    'sidebar.operations': '任务管理台',
 
     // Right Panel
     'panel.details': '节点详情',
@@ -118,7 +123,12 @@ const i18n = {
     'btn.stop': 'Stop',
 
     // Sidebar
-    'sidebar.operations': 'Operations',
+    // Dashboard Filters
+    'filter.all': 'All',
+    'filter.running': 'Running',
+    'filter.completed': 'Completed',
+    'filter.crashed': 'Crashed',
+    'sidebar.operations': 'Task Dashboard',
 
     // Right Panel
     'panel.details': 'Node Details',

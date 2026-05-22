@@ -402,6 +402,33 @@ async def api_graph_causal(op_id: str):
         
         return _reconstruct_causal_data(nodes, edges)
 
+@app.get("/api/ops/{op_id}/hypotheses")
+async def api_ops_hypotheses(op_id: str):
+    """List all Hypothesis nodes from the causal graph for an operation."""
+    async with AsyncSessionLocal() as session:
+        nodes_res = await session.execute(
+            select(GraphNodeModel).where(
+                GraphNodeModel.session_id == op_id,
+                GraphNodeModel.graph_type == 'causal',
+                GraphNodeModel.type == 'Hypothesis'
+            )
+        )
+        nodes = nodes_res.scalars().all()
+        hypotheses = []
+        for n in nodes:
+            data = n.data.copy() if n.data else {}
+            hypotheses.append({
+                "id": n.node_id,
+                "type": n.type,
+                "status": data.get("status") or n.status or "PENDING",
+                "description": data.get("description") or data.get("title") or data.get("hypothesis") or n.node_id,
+                "confidence": data.get("confidence", 0.5),
+                "created_at": n.created_at.timestamp() if n.created_at else None,
+            })
+        hypotheses.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        return {"hypotheses": hypotheses}
+
+
 @app.get("/api/tree/execution")
 async def api_tree_execution(op_id: str):
     # This requires reconstructing the hierarchy.
@@ -951,6 +978,24 @@ async def api_node_restart(node_id: str, request: Request):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
+
+
+@app.post("/api/webhook/test")
+async def api_webhook_test():
+    """测试告警通知配置是否正常工作."""
+    from core.notifier import Notifier
+
+    notifier = Notifier()
+    try:
+        ok = await notifier.send_alert(
+            "info",
+            "Test alert",
+            "Webhook configuration is working",
+        )
+        return {"ok": ok}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Alert test failed: {e}")
+
 
 if __name__ == "__main__":
     import uvicorn
