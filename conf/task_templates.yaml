@@ -1,0 +1,55 @@
+# 任务模板库 (Task Templates)
+# 使用方式: python agent.py --template "模板名称" --goal "目标域名/IP"
+# 或: python agent.py --template-list 查看所有可用模板
+
+templates:
+  - name: "Web 应用信息收集"
+    goal: "对 {target} 进行全面的信息收集，获取开放端口、服务指纹、技术栈、子域名和目录结构，为后续的漏洞挖掘建立基础情报"
+    recommended_tools:
+      - nmap
+      - httpx
+      - subfinder
+      - dirsearch
+      - nuclei
+
+  - name: "API 安全评估"
+    goal: "对 {target} 的 API 接口进行安全评估，识别未授权访问、注入漏洞、敏感信息泄露、速率限制缺失等 API 特有安全问题"
+    recommended_tools:
+      - http_request
+      - nuclei
+      - sqlmap
+
+  - name: "内网横向移动"
+    goal: "在已获得 {target} 初始访问权限的情况下，进行内网信息收集、权限提升、凭据获取和横向移动，扩大控制范围"
+    recommended_tools:
+      - nmap
+      - shell_exec
+
+  - name: "SQL 注入专项测试"
+    goal: "对 {target} 进行深度 SQL 注入测试，识别基于错误、盲注、时间延迟和联合查询等各类注入点，评估数据泄露风险"
+    recommended_tools:
+      - sqlmap
+      - http_request
+      - nuclei
+
+  - name: "漏洞扫描与验证"
+    goal: "对 {target} 执行全面的自动化漏洞扫描，使用 Nuclei 等工具识别已知 CVE 和常见漏洞配置，并对高危发现进行手工验证"
+    recommended_tools:
+      - nuclei
+      - nmap
+      - httpx
+      - searchsploit
+
+  - name: "子域名枚举与接管"
+    goal: "枚举 {target} 的全部子域名，识别解析到已下架服务（如 S3、GitHub Pages、Heroku 等）的可接管子域名"
+    recommended_tools:
+      - subfinder
+      - httpx
+      - http_request
+
+  - name: "WebShell 与后利用"
+    goal: "在 {target} 上尝试获取 WebShell 或建立持久化后门，进行文件系统探测、敏感配置文件读取和权限维持"
+    recommended_tools:
+      - shell_exec
+      - python_exec
+      - http_request

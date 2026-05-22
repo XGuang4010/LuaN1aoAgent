@@ -37,6 +37,8 @@ import httpx
 import subprocess
 import psutil
 
+import yaml
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -1198,7 +1200,9 @@ async def run_standalone_react(goal: str, task_name: str, log_dir: str, args: ar
 
 async def main():
     parser = argparse.ArgumentParser(description="LuaN1ao Agent")
-    parser.add_argument("--goal", required=True, help="The penetration testing goal for the agent.")
+    parser.add_argument("--goal", help="The penetration testing goal for the agent. Required unless using --template-list.")
+    parser.add_argument("--template", help="Use a predefined task template. The template's goal will be used with {target} replaced by --goal.")
+    parser.add_argument("--template-list", action="store_true", help="List all available task templates and exit.")
     parser.add_argument("--task-name", default="default_task", help="The name of the task, used for logging.")
     parser.add_argument("--log-dir", help="The directory to save logs. If not provided, defaults to logs/task_name/timestamp.")
 
@@ -1229,6 +1233,61 @@ async def main():
     parser.add_argument("--skip-preflight", action="store_true", help="Skip preflight checks on startup")
 
     args = parser.parse_args()
+
+    # --- Task Template Resolution ---
+    def _load_templates() -> List[Dict[str, Any]]:
+        templates_path = os.path.join(os.path.dirname(__file__), "conf", "task_templates.yaml")
+        if not os.path.isfile(templates_path):
+            console.print("[bold red]任务模板文件未找到: conf/task_templates.yaml[/bold red]")
+            return []
+        try:
+            with open(templates_path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f)
+            return data.get("templates", []) if data else []
+        except Exception as e:
+            console.print(f"[bold red]加载任务模板失败: {e}[/bold red]")
+            return []
+
+    if args.template_list:
+        templates = _load_templates()
+        if not templates:
+            console.print("[yellow]暂无可用任务模板。[/yellow]")
+        else:
+            table = Table(title="可用任务模板", show_header=True, header_style="bold magenta")
+            table.add_column("序号", style="dim", width=6)
+            table.add_column("模板名称", style="cyan", min_width=20)
+            table.add_column("推荐工具", style="green", min_width=30)
+            for idx, t in enumerate(templates, 1):
+                tools = ", ".join(t.get("recommended_tools", []))
+                table.add_row(str(idx), t.get("name", "N/A"), tools)
+            console.print(table)
+        sys.exit(0)
+
+    if args.template:
+        templates = _load_templates()
+        template_map = {t.get("name", ""): t for t in templates}
+        selected = template_map.get(args.template)
+        if not selected:
+            available = ", ".join(f'"{n}"' for n in template_map if n)
+            console.print(f"[bold red]未找到模板: {args.template}[/bold red]")
+            console.print(f"[yellow]可用模板: {available or '无'}[/yellow]")
+            sys.exit(1)
+        if not args.goal:
+            console.print("[bold red]使用 --template 时必须提供 --goal 作为目标占位符 (例如: --goal example.com)[/bold red]")
+            sys.exit(1)
+        template_goal = selected.get("goal", "").replace("{target}", args.goal)
+        console.print(Panel(
+            f"[bold green]使用任务模板: {args.template}[/bold green]\n"
+            f"目标: {args.goal}\n"
+            f"推荐工具: {', '.join(selected.get('recommended_tools', []))}",
+            title="模板加载",
+            style="bold blue"
+        ))
+        args.goal = template_goal
+    elif not args.goal:
+        console.print("[bold red]错误: 必须提供 --goal 或使用 --template-list 查看模板。[/bold red]")
+        sys.exit(1)
+    # --------------------------------
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGINT, signal_handler)
