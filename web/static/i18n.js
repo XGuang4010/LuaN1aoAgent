@@ -60,6 +60,9 @@ const i18n = {
     'type.task': '子任务',
     'type.action': '执行步骤',
 
+    // Tabs
+    'tab.hypothesis': '假设',
+
     // Legend
     'legend.title': '图例',
     'legend.node_types': '节点类型',
@@ -71,6 +74,15 @@ const i18n = {
     'msg.task_created': '任务创建成功',
     'msg.task_injected': '任务注入成功',
     'msg.operation_aborted': '操作已终止',
+    'msg.click_to_load': '点击标签加载假设数据',
+    'msg.loading': '加载中...',
+    'msg.load_failed': '加载失败',
+    'msg.no_hypotheses': '暂无假设数据',
+
+    // Hypothesis Panel
+    'panel.hypothesis_count': '共',
+    'panel.hypothesis_sorted': '条假设 (按置信度排序)',
+    'panel.confidence': '置信度',
 
     // Phase Status
     'phase.reflecting': '🤔 反思中...',
@@ -169,6 +181,9 @@ const i18n = {
     'type.task': 'Subtask',
     'type.action': 'Action',
 
+    // Tabs
+    'tab.hypothesis': 'Hypothesis',
+
     // Legend
     'legend.title': 'Legend',
     'legend.node_types': 'Node Types',
@@ -180,6 +195,15 @@ const i18n = {
     'msg.task_created': 'Task created successfully',
     'msg.task_injected': 'Task injected successfully',
     'msg.operation_aborted': 'Operation aborted',
+    'msg.click_to_load': 'Click tab to load hypotheses',
+    'msg.loading': 'Loading...',
+    'msg.load_failed': 'Failed to load',
+    'msg.no_hypotheses': 'No hypothesis data',
+
+    // Hypothesis Panel
+    'panel.hypothesis_count': '',
+    'panel.hypothesis_sorted': ' hypotheses (sorted by confidence)',
+    'panel.confidence': 'Confidence',
 
     // Phase Status
     'phase.reflecting': '🤔 Reflecting...',

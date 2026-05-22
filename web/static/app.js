@@ -201,15 +201,183 @@ function showAbortedBanner() {
 document.addEventListener('DOMContentLoaded', () => {
   initD3();
   initLogFilters();
+  checkMobileView();
   loadOps().then(() => { if (!state.op_id) { const f = document.querySelector('.task-card'); if (f) selectOp(f.dataset.op); } else selectOp(state.op_id, false); });
   setInterval(checkPendingIntervention, 2000);
+  initMobileLogSheet();
 });
+
+window.addEventListener('resize', () => {
+  checkMobileView();
+  if (state.op_id) render(true);
+});
+
+function checkMobileView() {
+  state.isMobile = window.innerWidth < 768;
+  document.body.classList.toggle('mobile-view', state.isMobile);
+
+  const dagSvg = document.getElementById('d3-graph');
+  const timeline = document.getElementById('mobile-timeline');
+  const controls = document.getElementById('controls');
+  const legend = document.getElementById('legend');
+  const details = document.getElementById('node-details-panel');
+
+  if (state.isMobile) {
+    if (dagSvg) dagSvg.style.display = 'none';
+    if (timeline) timeline.style.display = 'block';
+    if (controls) controls.style.display = 'none';
+    if (legend) legend.style.display = 'none';
+    if (details) details.classList.remove('show');
+  } else {
+    if (dagSvg) dagSvg.style.display = 'block';
+    if (timeline) timeline.style.display = 'none';
+    if (controls) controls.style.display = 'flex';
+    if (legend) legend.style.display = 'block';
+  }
+}
+
+function renderMobileTimeline(data) {
+  const container = document.getElementById('mobile-timeline');
+  if (!container) return;
+
+  if (!data || !data.nodes || data.nodes.length === 0) {
+    container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">' + (currentLang === 'zh' ? '暂无数据' : 'No data') + '</div>';
+    return;
+  }
+
+  const timelineNodes = data.nodes
+    .filter(n => n.type === 'action' || n.type === 'task')
+    .sort((a, b) => {
+      const timeA = a.completed_at || a.created_at || 0;
+      const timeB = b.completed_at || b.created_at || 0;
+      return timeB - timeA;
+    });
+
+  let h = '<div class="mobile-timeline-list">';
+  timelineNodes.forEach(n => {
+    const statusColor = nodeColors[n.status] || '#64748b';
+    const statusIcon = n.status === 'completed' ? '✓' :
+      n.status === 'failed' ? '✗' :
+        n.status === 'in_progress' || n.status === 'running' ? '◉' : '○';
+    const toolName = n.tool_name || (n.type === 'task' ? (currentLang === 'zh' ? '子任务' : 'Task') : (currentLang === 'zh' ? '动作' : 'Action'));
+    const findings = n.findings || (n.data && n.data.findings) || [];
+    const findingsCount = Array.isArray(findings) ? findings.length : Object.keys(findings).length;
+    const time = n.completed_at
+      ? new Date(n.completed_at * 1000).toLocaleTimeString()
+      : (n.created_at ? new Date(n.created_at * 1000).toLocaleTimeString() : '');
+
+    h += `
+      <div class="mobile-timeline-item" onclick="showDetailsFromTimeline('${escapeHtml(n.id)}')">
+        <div class="mobile-timeline-icon" style="color:${statusColor}">${statusIcon}</div>
+        <div class="mobile-timeline-content">
+          <div class="mobile-timeline-title">${escapeHtml(n.label || n.id)}</div>
+          <div class="mobile-timeline-meta">
+            <span class="mobile-timeline-tool">${escapeHtml(toolName)}</span>
+            ${findingsCount > 0 ? `<span class="mobile-timeline-findings">${findingsCount} ${currentLang === 'zh' ? '发现' : 'findings'}</span>` : ''}
+            <span class="mobile-timeline-time">${time}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  });
+  h += '</div>';
+  container.innerHTML = h;
+}
+
+function showDetailsFromTimeline(nodeId) {
+  if (!state._lastGraphData) return;
+  const node = state._lastGraphData.nodes.find(n => n.id === nodeId);
+  if (node) showDetails(node);
+}
+
+function initMobileLogSheet() {
+  const sheet = document.getElementById('mobile-log-sheet');
+  const handle = document.querySelector('.mobile-log-handle');
+  if (!sheet || !handle) return;
+
+  let startY = 0;
+  let isDragging = false;
+
+  handle.addEventListener('touchstart', e => {
+    startY = e.touches[0].clientY;
+    isDragging = true;
+  }, { passive: true });
+
+  handle.addEventListener('touchmove', e => {
+    if (!isDragging) return;
+    const deltaY = e.touches[0].clientY - startY;
+    if (sheet.classList.contains('expanded')) {
+      if (deltaY > 50) {
+        sheet.classList.remove('expanded');
+        isDragging = false;
+      }
+    } else {
+      if (deltaY < -50) {
+        sheet.classList.add('expanded');
+        isDragging = false;
+      }
+    }
+  }, { passive: true });
+
+  handle.addEventListener('touchend', () => {
+    isDragging = false;
+  });
+
+  handle.addEventListener('click', () => {
+    sheet.classList.toggle('expanded');
+  });
+}
 
 async function loadOps() {
   try {
     const data = await fetch('/api/ops').then(r => r.json());
-    const list = document.getElementById('ops'); list.innerHTML = '';
-    data.items.forEach(i => {
+    const list = document.getElementById('ops');
+
+    // Create or update filter bar
+    let filterBar = document.getElementById('task-filter-bar');
+    if (!filterBar) {
+      filterBar = document.createElement('div');
+      filterBar.id = 'task-filter-bar';
+      filterBar.className = 'task-filter-bar';
+      list.parentNode.insertBefore(filterBar, list);
+
+      const filters = [
+        { key: 'all', label: t('filter.all') || '全部' },
+        { key: 'running', label: t('filter.running') || '运行中' },
+        { key: 'completed', label: t('filter.completed') || '已完成' },
+        { key: 'crashed', label: t('filter.crashed') || '崩溃' }
+      ];
+
+      filters.forEach(f => {
+        const btn = document.createElement('button');
+        btn.className = 'task-filter-btn' + (f.key === state.taskFilter ? ' active' : '');
+        btn.textContent = f.label;
+        btn.onclick = () => {
+          state.taskFilter = f.key;
+          loadOps();
+        };
+        filterBar.appendChild(btn);
+      });
+    } else {
+      filterBar.querySelectorAll('.task-filter-btn').forEach((btn, idx) => {
+        const keys = ['all', 'running', 'completed', 'crashed'];
+        btn.classList.toggle('active', keys[idx] === state.taskFilter);
+      });
+    }
+
+    list.innerHTML = '';
+
+    // Filter items
+    let items = data.items;
+    if (state.taskFilter === 'running') {
+      items = items.filter(i => !i.status.achieved && !i.status.failed && !i.status.aborted);
+    } else if (state.taskFilter === 'completed') {
+      items = items.filter(i => i.status.achieved);
+    } else if (state.taskFilter === 'crashed') {
+      items = items.filter(i => i.status.failed || i.status.aborted);
+    }
+
+    items.forEach(i => {
       const li = document.createElement('li');
       li.className = `task-card ${i.op_id === state.op_id ? 'active' : ''}`;
       li.dataset.op = i.op_id;
@@ -218,36 +386,63 @@ async function loadOps() {
       li.dataset.statusFailed = i.status.failed ? 'true' : 'false';
       li.onclick = () => selectOp(i.op_id, false);
 
-      let color = 'var(--accent-primary)'; // Default: in progress / pending
-      if (i.status.achieved) color = 'var(--success)';
-      else if (i.status.failed) color = 'var(--error)';
-      else if (i.status.aborted) color = '#94a3b8'; // Grey for aborted
+      let statusColor, statusLabel, progressPercent, progressClass;
+      if (i.status.achieved) {
+        statusColor = 'var(--success)';
+        statusLabel = t('status.completed') || '已完成';
+        progressPercent = 100;
+        progressClass = '';
+      } else if (i.status.failed) {
+        statusColor = 'var(--error)';
+        statusLabel = t('status.failed') || '失败';
+        progressPercent = 100;
+        progressClass = '';
+      } else if (i.status.aborted) {
+        statusColor = '#94a3b8';
+        statusLabel = currentLang === 'zh' ? '已终止' : 'Aborted';
+        progressPercent = 100;
+        progressClass = '';
+      } else {
+        statusColor = 'var(--accent-primary)';
+        statusLabel = t('status.running') || '运行中';
+        progressPercent = 0;
+        progressClass = 'indeterminate';
+      }
 
-      // 显示名称：优先使用task_id（name字段），否则使用goal的前30字符
       const displayName = i.task_id || (i.goal ? i.goal.slice(0, 30) + (i.goal.length > 30 ? '...' : '') : 'Unnamed');
+      const targetText = i.goal ? escapeHtml(i.goal.slice(0, 50) + (i.goal.length > 50 ? '...' : '')) : '';
+      const timeText = i.updated_at
+        ? new Date(i.updated_at * 1000).toLocaleString()
+        : (i.created_at ? new Date(i.created_at * 1000).toLocaleString() : '');
 
       if (i.op_id === state.op_id) {
         state.taskStatus = i.status;
-        // 如果当前选中任务已是终态，确保移除所有过程横幅
         if (i.status.aborted || i.status.achieved || i.status.failed) {
           hidePhaseBanner();
         }
         updateDownloadButtonVisibility();
       }
 
-      li.innerHTML = `<div class="flex justify-between mb-1">
-          <span style="font-family:monospace;font-size:10px;opacity:0.7">#${i.op_id.slice(-4)}</span>
-          <div style="display:flex;gap:8px;align-items:center;">
-              <span class="status-dot" style="background:${color}" title="${i.status.raw}"></span>
+      const progressBar = `<div class="task-progress"><div class="task-progress-bar ${progressClass}" style="${progressPercent > 0 ? 'width:' + progressPercent + '%;' : ''}background:${statusColor}"></div></div>`;
+
+      li.innerHTML = `<div class="task-card-header">
+          <span class="task-card-id">#${i.op_id.slice(-4)}</span>
+          <div class="task-card-actions">
+              <span class="status-badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${statusLabel}</span>
               <span class="rename-btn" onclick="renameOp(event, '${i.op_id}', this)" title="Rename">✏️</span>
               <span class="delete-btn" onclick="deleteOp(event, '${i.op_id}')" title="Delete Task">✕</span>
           </div>
       </div>
-      <div class="task-name" data-op="${i.op_id}" style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(i.goal)}">${escapeHtml(displayName)}</div>`;
+      <div class="task-card-name" data-op="${i.op_id}" title="${escapeHtml(i.goal)}">${escapeHtml(displayName)}</div>
+      <div class="task-card-target" title="${escapeHtml(i.goal)}">${targetText}</div>
+      ${progressBar}
+      <div class="task-card-footer">
+          <span class="task-card-time">${timeText}</span>
+      </div>`;
       list.appendChild(li);
     });
     initOpsDragAndDrop();
-  } catch (e) { }
+  } catch (e) { console.error('loadOps error', e); }
 }
 
 function initOpsDragAndDrop() {
@@ -489,7 +684,13 @@ async function render(force) {
       return;
     }
 
-    drawForceGraph(data);
+    state._lastGraphData = data;
+
+    if (state.isMobile && state.view === 'exec') {
+      renderMobileTimeline(data);
+    } else {
+      drawForceGraph(data);
+    }
     updateLegend();
 
     // 检测规划完成：如果有子任务且当前处于 planning 阶段，切换为 executing
@@ -883,6 +1084,14 @@ function drawForceGraph(data) {
     .y(d => d.y)
     .curve(d3.curveBasis); // 使用 Basis 样条插值实现平滑曲线
 
+  // Build node type and confidence maps for causal edge animation
+  const nodeTypeMap = new Map();
+  const nodeConfidenceMap = new Map();
+  data.nodes.forEach(n => {
+    nodeTypeMap.set(n.id, n.node_type || n.type);
+    nodeConfidenceMap.set(n.id, n.confidence !== undefined ? n.confidence : 0.5);
+  });
+
   const links = g.selectAll(".link")
     .data(dagreGraph.edges())
     .enter().append("path")
@@ -890,13 +1099,58 @@ function drawForceGraph(data) {
       const edgeData = dagreGraph.edge(d);
       // 如果目标节点正在运行，则连线也设为 active
       const targetNode = data.nodes.find(n => n.id === d.w);
-      return `link ${targetNode && targetNode.status === 'running' ? 'active' : ''}`;
+      let classes = `link ${targetNode && targetNode.status === 'running' ? 'active' : ''}`;
+
+      // Causal edge animation: Evidence -> Hypothesis -> Vulnerability
+      if (state.view === 'causal') {
+        const sourceType = nodeTypeMap.get(d.v);
+        const targetType = nodeTypeMap.get(d.w);
+        const isCausalEdge = (sourceType === 'Evidence' && targetType === 'Hypothesis') ||
+                             (sourceType === 'Hypothesis' && (targetType === 'Vulnerability' || targetType === 'ConfirmedVulnerability'));
+        if (isCausalEdge) {
+          classes += ' causal-link';
+        }
+      }
+      return classes;
     })
     .attr("d", d => {
       const points = dagreGraph.edge(d).points;
       return lineGen(points);
     })
-    .attr("marker-end", "url(#arrow)");
+    .attr("marker-end", "url(#arrow)")
+    .style("stroke-width", d => {
+      if (state.view === 'causal') {
+        const sourceType = nodeTypeMap.get(d.v);
+        const targetType = nodeTypeMap.get(d.w);
+        const isCausalEdge = (sourceType === 'Evidence' && targetType === 'Hypothesis') ||
+                             (sourceType === 'Hypothesis' && (targetType === 'Vulnerability' || targetType === 'ConfirmedVulnerability'));
+        if (isCausalEdge) {
+          const confidence = (sourceType === 'Evidence' && targetType === 'Hypothesis')
+            ? (nodeConfidenceMap.get(d.w) || 0.5)
+            : (nodeConfidenceMap.get(d.v) || 0.5);
+          // Higher confidence = thicker line (1.5px to 4px)
+          return 1.5 + confidence * 2.5;
+        }
+      }
+      return 2;
+    })
+    .style("animation-duration", d => {
+      if (state.view === 'causal') {
+        const sourceType = nodeTypeMap.get(d.v);
+        const targetType = nodeTypeMap.get(d.w);
+        const isCausalEdge = (sourceType === 'Evidence' && targetType === 'Hypothesis') ||
+                             (sourceType === 'Hypothesis' && (targetType === 'Vulnerability' || targetType === 'ConfirmedVulnerability'));
+        if (isCausalEdge) {
+          const confidence = (sourceType === 'Evidence' && targetType === 'Hypothesis')
+            ? (nodeConfidenceMap.get(d.w) || 0.5)
+            : (nodeConfidenceMap.get(d.v) || 0.5);
+          // Higher confidence = faster flow (0.5s to 2s)
+          const duration = Math.max(0.5, 2.0 - confidence * 1.5);
+          return duration + 's';
+        }
+      }
+      return null;
+    });
 
   // 4. 绘制节点 (圆角矩形)
   const nodes = g.selectAll(".node")
@@ -2012,6 +2266,7 @@ function showDetails(d) {
     { id: 'overview', label: t('tab.overview') || '概览' },
     { id: 'findings', label: t('tab.findings') || '发现' },
     { id: 'evidence', label: t('tab.evidence') || '证据' },
+    { id: 'hypothesis', label: t('tab.hypothesis') || '假设' },
     { id: 'raw', label: t('tab.raw') || '原始输出' },
     { id: 'suggestions', label: t('tab.suggestions') || '建议' },
   ];
@@ -2025,6 +2280,7 @@ function showDetails(d) {
   h += `<div class="tab-pane active" id="tab-overview">${renderOverviewTab(d)}</div>`;
   h += `<div class="tab-pane" id="tab-findings">${renderFindingsTab(d)}</div>`;
   h += `<div class="tab-pane" id="tab-evidence">${renderEvidenceTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-hypothesis">${renderHypothesisTab(d)}</div>`;
   h += `<div class="tab-pane" id="tab-raw">${renderRawTab(d)}</div>`;
   h += `<div class="tab-pane" id="tab-suggestions">${renderSuggestionsTab(d)}</div>`;
 
@@ -2038,6 +2294,10 @@ function switchDetailTab(tabName, btn) {
   if (btn) btn.classList.add('active');
   const pane = document.getElementById('tab-' + tabName);
   if (pane) pane.classList.add('active');
+
+  if (tabName === 'hypothesis') {
+    loadHypotheses();
+  }
 }
 
 function renderOverviewTab(d) {
@@ -2176,6 +2436,64 @@ function renderSuggestionsTab(d) {
       h += `<div class="suggestion-item">• ${escapeHtml(s)}</div>`;
     });
     h += `</div>`;
+  });
+  return h;
+}
+
+function renderHypothesisTab(d) {
+  return '<div id="hypothesis-tab-content" style="padding:4px 0;"><div style="text-align:center;color:var(--text-muted);padding:20px;font-size:12px;">' + (t('msg.click_to_load') || '点击标签加载假设数据') + '</div></div>';
+}
+
+async function loadHypotheses() {
+  const container = document.getElementById('hypothesis-tab-content');
+  if (!container) return;
+  if (!state.op_id) {
+    container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.no_opid') || '未选择任务') + '</div>';
+    return;
+  }
+  container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.loading') || '加载中...') + '</div>';
+  try {
+    const data = await api('/api/ops/' + state.op_id + '/hypotheses');
+    container.innerHTML = renderHypothesisList(data.hypotheses || []);
+  } catch (e) {
+    container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.load_failed') || '加载失败') + '</div>';
+  }
+}
+
+function renderHypothesisList(hypotheses) {
+  if (!hypotheses || hypotheses.length === 0) {
+    return '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.no_hypotheses') || '暂无假设数据') + '</div>';
+  }
+  let h = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">' + (t('panel.hypothesis_count') || '共') + ' ' + hypotheses.length + ' ' + (t('panel.hypothesis_sorted') || '条假设 (按置信度排序)') + '</div>';
+  hypotheses.forEach(hy => {
+    const status = (hy.status || 'PENDING').toUpperCase();
+    const statusColors = {
+      'PENDING': '#64748b',
+      'SUPPORTED': '#10b981',
+      'FALSIFIED': '#ef4444',
+      'CONTRADICTED': '#f59e0b',
+      'CONFIRMED': '#f59e0b'
+    };
+    const statusColor = statusColors[status] || '#64748b';
+
+    const confidence = hy.confidence !== undefined ? hy.confidence : 0;
+    let confColor = '#ef4444';
+    if (confidence > 0.7) confColor = '#10b981';
+    else if (confidence > 0.4) confColor = '#f59e0b';
+
+    h += `<div class="finding-item" style="margin-bottom:8px;">
+      <div class="finding-item-header" style="margin-bottom:4px;">
+        <span style="font-weight:500;font-size:12px;color:var(--text-main);">${escapeHtml(hy.description || hy.id || '未命名假设')}</span>
+        <span class="ev-cat-tag" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${escapeHtml(status)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+        <span style="font-size:10px;color:var(--text-muted);">${t('panel.confidence') || '置信度'}</span>
+        <div style="flex:1;height:6px;background:rgba(100,116,139,0.3);border-radius:3px;overflow:hidden;">
+          <div style="width:${(confidence * 100).toFixed(0)}%;height:100%;background:${confColor};border-radius:3px;"></div>
+        </div>
+        <span style="font-size:11px;font-weight:bold;color:${confColor};">${(confidence * 100).toFixed(0)}%</span>
+      </div>
+    </div>`;
   });
   return h;
 }
@@ -2484,6 +2802,13 @@ function subscribe() {
       if (eventType === 'graph.changed' || eventType === 'graph.synced' || eventType === 'execution.step.completed') {
         if (!state.missionAccomplished) {
           render();
+        }
+        // Throttled refresh of task list to update card status/progress
+        if (!opsRefreshDebounce) {
+          opsRefreshDebounce = setTimeout(() => {
+            loadOps();
+            opsRefreshDebounce = null;
+          }, 2000);
         }
       }
       if (eventType === 'ping' || eventType === 'graph.ready' || eventType === 'graph.synced') return;
