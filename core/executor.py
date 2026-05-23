@@ -440,6 +440,13 @@ async def _build_executor_prompt(
         main_goal=main_goal, subtask=subtask, context=context, global_mission_briefing=global_mission_briefing
     )
 
+    # TestPolicy injection: append policy_context to system prompt if present
+    extra_data = subtask_data.get("extra_data") or {}
+    policy_context = extra_data.get("policy_context")
+    if policy_context:
+        policy_section = f"\n【测试约束】\n{json.dumps(policy_context, ensure_ascii=False)}\n"
+        system_prompt += policy_section
+
     if not messages or messages[0]["role"] != "system":
         messages.insert(0, {"role": "system", "content": system_prompt})
     else:
@@ -969,6 +976,22 @@ async def run_executor_cycle(
                         "status": step_status,
                     },
                 )
+
+                # ReconStore integration: auto-extract info from tool output
+                if step_status == "completed" and result_str:
+                    try:
+                        from core.recon_extractor import ReconExtractor
+                        extractor = ReconExtractor()
+                        await extractor.extract_from_tool_result(
+                            task_id=graph_manager.task_id,
+                            step_id=step_id,
+                            tool_name=tool_name,
+                            tool_params=action if isinstance(action, dict) else {},
+                            result_str=result_str,
+                        )
+                    except Exception:
+                        # Silent fail: recon extraction should not block main flow
+                        pass
 
                 # P1-1: 假设跨步持久化 — 将 formulate_hypotheses 输出写入子任务节点
                 if tool_name == "formulate_hypotheses" and step_status == "completed":

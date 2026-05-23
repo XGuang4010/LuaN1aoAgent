@@ -26,7 +26,7 @@ from core.database.utils import (
     get_pending_intervention_request,
     create_intervention_request,
 )
-from core.database.models import SessionModel, GraphNodeModel, GraphEdgeModel, EventLogModel, InterventionModel
+from core.database.models import SessionModel, GraphNodeModel, GraphEdgeModel, EventLogModel, InterventionModel, ReconRecord
 from core.intervention import intervention_manager # Added this line
 from conf.config import WEB_HOST, WEB_PORT
 from core.events import broker
@@ -979,6 +979,74 @@ async def api_node_restart(node_id: str, request: Request):
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse(request=request, name="index.html")
+
+
+@app.get("/recon", response_class=HTMLResponse)
+async def recon_page(request: Request):
+    return templates.TemplateResponse(request=request, name="recon.html")
+
+
+@app.get("/api/recon/{task_id}")
+async def api_recon_list(task_id: str, type: str = "", target: str = "", limit: int = 100):
+    async with AsyncSessionLocal() as session:
+        query = select(ReconRecord).where(ReconRecord.task_id == task_id)
+        if type:
+            query = query.where(ReconRecord.record_type == type)
+        if target:
+            query = query.where(ReconRecord.target == target)
+        query = query.order_by(desc(ReconRecord.created_at)).limit(limit)
+        result = await session.execute(query)
+        records = result.scalars().all()
+        return {
+            "items": [
+                {
+                    "id": r.id,
+                    "task_id": r.task_id,
+                    "record_type": r.record_type,
+                    "target": r.target,
+                    "value": r.value,
+                    "source_step_id": r.source_step_id,
+                    "confidence": r.confidence,
+                    "created_at": r.created_at.timestamp() if r.created_at else None,
+                }
+                for r in records
+            ],
+            "total": len(records),
+        }
+
+
+@app.get("/api/recon/{task_id}/summary")
+async def api_recon_summary(task_id: str):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ReconRecord.record_type, ReconRecord.target)
+            .where(ReconRecord.task_id == task_id)
+        )
+        rows = result.all()
+        type_counts = {}
+        target_counts = {}
+        for record_type, target in rows:
+            type_counts[record_type] = type_counts.get(record_type, 0) + 1
+            target_counts[target] = target_counts.get(target, 0) + 1
+        return {
+            "task_id": task_id,
+            "total_records": len(rows),
+            "type_breakdown": type_counts,
+            "target_breakdown": target_counts,
+            "unique_targets": len(target_counts),
+        }
+
+
+@app.get("/api/recon/{task_id}/targets")
+async def api_recon_targets(task_id: str):
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            select(ReconRecord.target)
+            .where(ReconRecord.task_id == task_id)
+            .distinct()
+        )
+        targets = [row[0] for row in result.all()]
+        return {"targets": targets}
 
 
 @app.post("/api/webhook/test")

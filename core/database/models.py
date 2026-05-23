@@ -164,3 +164,33 @@ class ScopeRuleModel(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
 
     session: Mapped["SessionModel"] = relationship(back_populates="scope_rules")
+
+
+class ReconRecord(Base):
+    """侦察记录表，存储各阶段收集到的原始情报"""
+    __tablename__ = "recon_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String, index=True)
+    record_type: Mapped[str] = mapped_column(String, index=True)
+    target: Mapped[str] = mapped_column(String, index=True)
+    value: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
+    source_step_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    confidence: Mapped[Optional[float]] = mapped_column(nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class TaskPolicy(Base):
+    """任务策略表，存储解析后的测试策略"""
+    __tablename__ = "task_policies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    task_id: Mapped[str] = mapped_column(String, index=True, unique=True)
+    raw_policy: Mapped[str] = mapped_column(Text)
+    parsed_policy: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
+    parse_status: Mapped[str] = mapped_column(String, default="pending")
+    parse_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), onupdate=func.now(), server_default=func.now()
+    )

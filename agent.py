@@ -296,17 +296,18 @@ def _is_goal_achieved_status(status: Any) -> bool:
     """兼容 legacy 状态值，统一识别 goal_achieved。"""
     return str(status or "").strip().lower() == "goal_achieved"
 
-def process_graph_commands(operations: List[Dict], graph_manager: GraphManager) -> None:
+def process_graph_commands(operations: List[Dict], graph_manager: GraphManager, policy=None) -> None:
     """
-    处理图操作指令列表. 
-    
+    处理图操作指令列表.
+
     优化操作执行顺序，先添加节点，再删除/废弃节点，最后更新节点，
     避免对已删除节点进行操作，确保图谱状态的一致性。
-    
+
     Args:
         operations: 图操作指令列表，每个操作包含command和相关参数
         graph_manager: 图谱管理器实例
-    
+        policy: 可选的 TestPolicy 实例，用于注入测试约束
+
     Returns:
         None
     """
@@ -344,9 +345,20 @@ def process_graph_commands(operations: List[Dict], graph_manager: GraphManager) 
         if not node_id or node_id == "None":
             console.print(f"⚠️  跳过无效的 ADD_NODE 操作（缺少 node_id）: {node_data}", style="yellow")
             continue
+        # TestPolicy injection: classify vulnerability type and attach constraints
+        extra_data = None
+        if policy and node_data.get("description"):
+            vuln_type = policy.classify_vuln_type(node_data["description"])
+            if vuln_type:
+                constraints = policy.get_constraints(vuln_type)
+                if constraints:
+                    extra_data = {"policy_context": constraints}
+
         # 如果节点已存在，避免重复添加，改为 UPDATE_NODE 合并属性
         if graph_manager.graph.has_node(node_id):
             updates = {k: v for k, v in node_data.items() if k not in {"id", "dependencies"}}
+            if extra_data:
+                updates["extra_data"] = extra_data
             if updates:
                 graph_manager.update_node(node_id, updates)
             else:
@@ -362,6 +374,7 @@ def process_graph_commands(operations: List[Dict], graph_manager: GraphManager) 
             completion_criteria=node_data.get('completion_criteria', ''),
             mission_briefing=node_data.get('mission_briefing'),
             max_steps=node_data.get('max_steps'),
+            extra_data=extra_data,
         )
 
     # ADD_NODE 完成后校验 DAG 完整性：检测环形依赖

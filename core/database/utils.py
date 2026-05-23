@@ -9,7 +9,16 @@ from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, Asyn
 from sqlalchemy import select, update, delete, event
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from .models import Base, SessionModel, GraphNodeModel, GraphEdgeModel, EventLogModel, InterventionModel
+from .models import (
+    Base,
+    SessionModel,
+    GraphNodeModel,
+    GraphEdgeModel,
+    EventLogModel,
+    InterventionModel,
+    ReconRecord,
+    TaskPolicy,
+)
 
 # Default to a local SQLite database file
 DB_PATH = os.getenv("DATABASE_PATH", "luan1ao.db")
@@ -423,7 +432,12 @@ def schedule_coroutine(coro):
         task.add_done_callback(handle_result)
     except RuntimeError:
         # No running loop (shouldn't happen in Agent execution, but safe fallback)
-        pass
+        logging.warning(
+            "schedule_coroutine called without running event loop. "
+            "Coroutine %s will not execute.",
+            getattr(coro, '__qualname__', getattr(coro, '__name__', repr(coro)))
+        )
+        coro.close()
 
 
 async def get_session(session_id: str) -> Optional[SessionModel]:

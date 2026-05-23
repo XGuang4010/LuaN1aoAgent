@@ -2329,5 +2329,326 @@ async def nuclei_list_templates(
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
+# ==============================================================================
+# Recon Tools - nmap_scan, httpx_scan, info_extract
+# ==============================================================================
+
+def _resolve_tool_path(tool_name: str, env_var: str, default_subpath: str = None) -> str:
+    """解析外部工具路径（三层优先级）。"""
+    # 1. 单工具环境变量
+    path = os.environ.get(env_var)
+    if path:
+        return path
+
+    # 2. TOOLS_HOME 约定路径
+    tools_home = os.environ.get("TOOLS_HOME")
+    if tools_home and default_subpath:
+        candidate = os.path.join(tools_home, default_subpath)
+        if os.path.exists(candidate):
+            return candidate
+        # 尝试 .exe 后缀（Windows）
+        candidate_exe = candidate + ".exe"
+        if os.path.exists(candidate_exe):
+            return candidate_exe
+
+    # 3. 直接失败：不依赖系统 PATH 兜底，未配置时明确报错
+    raise FileNotFoundError(
+        f"Tool '{tool_name}' not found. "
+        f"Please set {env_var} environment variable, "
+        f"or install it to {tools_home}/{default_subpath} if TOOLS_HOME is configured."
+    )
+
+
+def _parse_nmap_output(output: str) -> Dict[str, Any]:
+    """解析 nmap 原始输出为结构化 findings。"""
+    import re
+
+    hosts: List[Dict[str, Any]] = []
+    current_host: Optional[Dict[str, Any]] = None
+    in_port_section = False
+
+    for line in output.splitlines():
+        line = line.rstrip()
+
+        # Host line: "Nmap scan report for hostname (ip)" or "Nmap scan report for ip"
+        host_match = re.match(r"Nmap scan report for (.+)", line)
+        if host_match:
+            if current_host:
+                hosts.append(current_host)
+            host_part = host_match.group(1).strip()
+            # Check if format is "hostname (ip)"
+            paren_match = re.match(r"(.+)\s+\(([^)]+)\)", host_part)
+            if paren_match:
+                hostname = paren_match.group(1).strip()
+                ip = paren_match.group(2).strip()
+            else:
+                hostname = ""
+                ip = host_part
+            current_host = {
+                "ip": ip,
+                "hostname": hostname,
+                "mac": "",
+                "vendor": "",
+                "os": {},
+                "ports": [],
+                "scripts": [],
+            }
+            in_port_section = False
+            continue
+
+        if current_host is None:
+            continue
+
+        # MAC Address
+        mac_match = re.match(r"MAC Address:\s*([0-9A-Fa-f:]+)(?:\s+\(([^)]+)\))?", line)
+        if mac_match:
+            current_host["mac"] = mac_match.group(1)
+            if mac_match.group(2):
+                current_host["vendor"] = mac_match.group(2)
+            continue
+
+        # Port header
+        if re.match(r"PORT\s+STATE\s+SERVICE", line):
+            in_port_section = True
+            continue
+
+        # Port line: "80/tcp open  http     nginx 1.18.0"
+        if in_port_section:
+            port_match = re.match(
+                r"(\d+)/(tcp|udp|sctp)\s+(\S+)\s+(\S+)(?:\s+(.+))?",
+                line
+            )
+            if port_match:
+                port_num = int(port_match.group(1))
+                protocol = port_match.group(2)
+                state = port_match.group(3)
+                service_name = port_match.group(4)
+                version_info = (port_match.group(5) or "").strip()
+
+                service: Dict[str, Any] = {"name": service_name}
+                if version_info:
+                    # Try parse "product version" format
+                    vparts = version_info.split(None, 1)
+                    service["product"] = vparts[0]
+                    if len(vparts) > 1:
+                        service["version"] = vparts[1]
+
+                current_host["ports"].append({
+                    "number": port_num,
+                    "protocol": protocol,
+                    "state": state,
+                    "service": service,
+                })
+            else:
+                # If line doesn't match port pattern and is not empty, port section ended
+                if line.strip() and not line.startswith("|") and not line.startswith("|_"):
+                    in_port_section = False
+            continue
+
+    if current_host:
+        hosts.append(current_host)
+
+    total_open = sum(
+        len([p for p in h["ports"] if p["state"] == "open"])
+        for h in hosts
+    )
+
+    return {
+        "hosts": hosts,
+        "summary": {
+            "total_hosts": len(hosts),
+            "up_hosts": len(hosts),
+            "total_open_ports": total_open,
+        },
+    }
+
+
+def _parse_httpx_output(output: str) -> Dict[str, Any]:
+    """解析 httpx 原始输出为结构化 findings。"""
+    import re
+
+    endpoints: List[Dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Format: https://example.com [200] [Example]
+        match = re.match(r"(https?://\S+)\s+\[(\d+)\]\s+\[(.*)\]", line)
+        if match:
+            url = match.group(1)
+            status_code = int(match.group(2))
+            title = match.group(3).strip()
+            endpoints.append({
+                "url": url,
+                "status_code": status_code,
+                "title": title,
+            })
+
+    # Any endpoint that appears in httpx stdout was successfully probed
+    successful = len(endpoints)
+    failed = 0
+
+    return {
+        "endpoints": endpoints,
+        "summary": {
+            "total_urls": len(endpoints),
+            "successful": successful,
+            "failed": failed,
+        },
+    }
+
+
+@mcp.tool()
+async def nmap_scan(target: str, ports: str = "1-65535", args: str = "-sV") -> str:
+    """
+    Nmap 端口扫描工具，执行后解析原始输出并生成 structured_findings。
+
+    Args:
+        target: 扫描目标（IP 或域名）
+        ports: 端口范围，默认 "1-65535"
+        args: 额外 nmap 参数，默认 "-sV"
+
+    Returns:
+        JSON 包含 success、raw_output、structured_findings
+    """
+    output_lines: List[str] = []
+    try:
+        tool_path = _resolve_tool_path("nmap", "NMAP_PATH", "nmap/nmap.exe")
+        cmd = f"{tool_path} -p {ports} {args} {target}"
+
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace")
+            output_lines.append(decoded)
+
+        return_code = await process.wait()
+        full_output = "".join(output_lines)
+
+        if return_code != 0:
+            error_type = "RUNTIME"
+            fix_suggestion = "Check the command's arguments and permissions."
+            if "not found" in full_output or "No such file or directory" in full_output:
+                error_type = "MISSING_TOOL"
+                fix_suggestion = "nmap is not installed or not in PATH."
+            return json.dumps({
+                "success": False,
+                "output": full_output,
+                "error_type": error_type,
+                "message": f"nmap exited with code {return_code}.",
+                "fix_suggestion": fix_suggestion,
+            })
+
+        structured = _parse_nmap_output(full_output)
+        return json.dumps({
+            "success": True,
+            "raw_output": full_output,
+            "structured_findings": structured,
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.exception("nmap_scan execution failed")
+        return json.dumps({
+            "success": False,
+            "error_type": "RUNTIME",
+            "message": f"nmap_scan failed: {e}",
+            "fix_suggestion": "Check target validity and tool availability.",
+        })
+
+
+@mcp.tool()
+async def httpx_scan(urls: str, args: str = "-title -tech -status-code") -> str:
+    """
+    Httpx 批量 HTTP 探测工具，执行后解析原始输出并生成 structured_findings。
+
+    Args:
+        urls: 目标 URL 列表（换行分隔或单个 URL）
+        args: 额外 httpx 参数，默认 "-title -tech -status-code"
+
+    Returns:
+        JSON 包含 success、raw_output、structured_findings
+    """
+    output_lines: List[str] = []
+    try:
+        tool_path = _resolve_tool_path("httpx", "HTTPX_PATH", "httpx/httpx.exe")
+        # Pipe URLs via stdin
+        cmd = f"echo {urls} | {tool_path} {args}"
+
+        process = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace")
+            output_lines.append(decoded)
+
+        return_code = await process.wait()
+        full_output = "".join(output_lines)
+
+        if return_code != 0:
+            error_type = "RUNTIME"
+            fix_suggestion = "Check the command's arguments and permissions."
+            if "not found" in full_output or "No such file or directory" in full_output:
+                error_type = "MISSING_TOOL"
+                fix_suggestion = "httpx is not installed or not in PATH."
+            return json.dumps({
+                "success": False,
+                "output": full_output,
+                "error_type": error_type,
+                "message": f"httpx exited with code {return_code}.",
+                "fix_suggestion": fix_suggestion,
+            })
+
+        structured = _parse_httpx_output(full_output)
+        return json.dumps({
+            "success": True,
+            "raw_output": full_output,
+            "structured_findings": structured,
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.exception("httpx_scan execution failed")
+        return json.dumps({
+            "success": False,
+            "error_type": "RUNTIME",
+            "message": f"httpx_scan failed: {e}",
+            "fix_suggestion": "Check target validity and tool availability.",
+        })
+
+
+@mcp.tool()
+async def info_extract(text: str, context: str = "") -> str:
+    """
+    从任意文本中提取结构化 recon 信息。
+
+    当前为 mock 实现，返回空 records 列表；后续由 LLM 驱动。
+
+    Args:
+        text: 待提取的原始文本
+        context: 提取上下文说明（如 "nmap 扫描结果"）
+
+    Returns:
+        JSON 包含 records 列表
+    """
+    return json.dumps({
+        "success": True,
+        "records": [],
+        "context": context,
+        "note": "Mock implementation; LLM-driven extraction not yet enabled.",
+    }, ensure_ascii=False, indent=2)
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -174,6 +174,7 @@ function hidePhaseBanner() {
 // 显示任务成功横幅
 function showSuccessBanner() {
   const banner = document.getElementById('phase-banner');
+  if (!banner) return;
   const spinner = banner.querySelector('.spinner');
   const text = document.getElementById('phase-text');
 
@@ -187,6 +188,7 @@ function showSuccessBanner() {
 // 显示任务已终止横幅
 function showAbortedBanner() {
   const banner = document.getElementById('phase-banner');
+  if (!banner) return;
   const spinner = banner.querySelector('.spinner');
   const text = document.getElementById('phase-text');
 
@@ -205,6 +207,11 @@ document.addEventListener('DOMContentLoaded', () => {
   loadOps().then(() => { if (!state.op_id) { const f = document.querySelector('.task-card'); if (f) selectOp(f.dataset.op); } else selectOp(state.op_id, false); });
   setInterval(checkPendingIntervention, 2000);
   initMobileLogSheet();
+  initPanelDrag();
+  const hitlCheckbox = document.getElementById('create-hitl');
+  if (hitlCheckbox) {
+    hitlCheckbox.addEventListener('change', updateHitlLabel);
+  }
 });
 
 window.addEventListener('resize', () => {
@@ -233,6 +240,7 @@ function checkMobileView() {
     if (rightPanel) {
       rightPanel.classList.add('collapsed');
       rightPanel.classList.remove('expanded');
+      state.rightSidebarCollapsed = true;
     }
   } else {
     if (dagSvg) dagSvg.style.display = 'block';
@@ -242,6 +250,7 @@ function checkMobileView() {
     if (rightPanel) {
       rightPanel.classList.remove('collapsed');
       rightPanel.classList.remove('expanded');
+      state.rightSidebarCollapsed = false;
     }
   }
 }
@@ -251,7 +260,23 @@ function renderMobileTimeline(data) {
   if (!container) return;
 
   if (!data || !data.nodes || data.nodes.length === 0) {
-    container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">' + (currentLang === 'zh' ? '暂无数据' : 'No data') + '</div>';
+    if (state.placeholderRootNode && state.placeholderRootNode.id === state.op_id) {
+      const p = state.placeholderRootNode;
+      const statusColor = nodeColors[p.status] || '#64748b';
+      container.innerHTML = `<div class="mobile-timeline-list">
+        <div class="mobile-timeline-item">
+          <div class="mobile-timeline-icon" style="color:${statusColor}">◉</div>
+          <div class="mobile-timeline-content">
+            <div class="mobile-timeline-title">${escapeHtml(p.label || p.id)}</div>
+            <div class="mobile-timeline-meta">
+              <span class="mobile-timeline-tool">${t('timeline.planning') || 'Planning...'}</span>
+            </div>
+          </div>
+        </div>
+      </div>`;
+      return;
+    }
+    container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">' + (t('timeline.no_data') || 'No data') + '</div>';
     return;
   }
 
@@ -272,7 +297,7 @@ function renderMobileTimeline(data) {
       n.status === 'failed' ? '✗' :
         n.status === 'in_progress' || n.status === 'running' ? '◉' : '○';
     const toolName = isExec
-      ? (n.tool_name || (n.type === 'task' ? (currentLang === 'zh' ? '子任务' : 'Task') : (currentLang === 'zh' ? '动作' : 'Action')))
+      ? (n.tool_name || (n.type === 'task' ? t('type.task') : t('type.action')))
       : (n.node_type || n.type || 'Node');
     const findings = n.findings || (n.data && n.data.findings) || [];
     const findingsCount = Array.isArray(findings) ? findings.length : Object.keys(findings).length;
@@ -287,7 +312,7 @@ function renderMobileTimeline(data) {
           <div class="mobile-timeline-title">${escapeHtml(n.label || n.id)}</div>
           <div class="mobile-timeline-meta">
             <span class="mobile-timeline-tool">${escapeHtml(toolName)}</span>
-            ${findingsCount > 0 ? `<span class="mobile-timeline-findings">${findingsCount} ${currentLang === 'zh' ? '发现' : 'findings'}</span>` : ''}
+            ${findingsCount > 0 ? `<span class="mobile-timeline-findings">${findingsCount} ${t('timeline.findings')}</span>` : ''}
             <span class="mobile-timeline-time">${time}</span>
           </div>
         </div>
@@ -572,7 +597,7 @@ async function renameOp(e, opId, btn) {
   e.stopPropagation();
 
   const taskCard = btn.closest('.task-card');
-  const nameEl = taskCard.querySelector('.task-name');
+  const nameEl = taskCard.querySelector('.task-card-name');
   if (!nameEl) return;
 
   const currentName = nameEl.textContent;
@@ -628,7 +653,12 @@ async function renameOp(e, opId, btn) {
 }
 
 function selectOp(id, refresh = true) {
-  if (!id) return; state.op_id = id;
+  if (!id) return;
+  if (opsRefreshDebounce) {
+    clearTimeout(opsRefreshDebounce);
+    opsRefreshDebounce = null;
+  }
+  state.op_id = id;
   document.querySelectorAll('.task-card').forEach(el => el.classList.toggle('active', el.dataset.op === id));
   history.replaceState(null, '', `?op_id=${id}`);
   document.getElementById('llm-stream').innerHTML = '';
@@ -680,6 +710,12 @@ async function render(force) {
   // 记录当前渲染的任务ID，用于检测竞争条件
   const renderingOpId = state.op_id;
 
+  // 清除已有的防抖定时器
+  if (state.renderDebounceTimer) {
+    clearTimeout(state.renderDebounceTimer);
+    state.renderDebounceTimer = null;
+  }
+
   // 防抖：如果上次渲染时间距现在不足 300ms 且非强制刷新，则跳过
   const now = Date.now();
   if (!force && state.missionAccomplished && (now - state.lastRenderTime) < 500) {
@@ -687,10 +723,13 @@ async function render(force) {
     return;
   }
 
-  // 清除已有的防抖定时器
-  if (state.renderDebounceTimer) {
-    clearTimeout(state.renderDebounceTimer);
-    state.renderDebounceTimer = null;
+  // 通用防抖：非强制刷新时延迟 200ms 执行
+  if (!force) {
+    state.renderDebounceTimer = setTimeout(() => {
+      state.renderDebounceTimer = null;
+      render(true);
+    }, 200);
+    return;
   }
 
   state.lastRenderTime = now;
@@ -1294,20 +1333,20 @@ function drawForceGraph(data) {
         const nodeType = n.node_type || n.type;
         // 节点类型翻译映射
         const typeLabels = {
-          'KeyFact': currentLang === 'zh' ? '关键事实' : 'Key Fact',
-          'Evidence': currentLang === 'zh' ? '证据' : 'Evidence',
-          'Hypothesis': currentLang === 'zh' ? '假设' : 'Hypothesis',
-          'Vulnerability': currentLang === 'zh' ? '漏洞' : 'Vuln',
-          'ConfirmedVulnerability': currentLang === 'zh' ? '确认漏洞' : 'Confirmed',
-          'Flag': 'Flag'
+          'KeyFact': t('causal.keyfact'),
+          'Evidence': t('causal.evidence'),
+          'Hypothesis': t('causal.hypothesis'),
+          'Vulnerability': t('causal.vulnerability'),
+          'ConfirmedVulnerability': t('causal.confirmed_vuln'),
+          'Flag': t('causal.flag')
         };
         return typeLabels[nodeType] || nodeType || 'UNKNOWN';
       }
 
       // 执行图：显示任务类型
-      if (n.type === 'root') return currentLang === 'zh' ? '主任务' : 'Root';
-      if (n.type === 'task') return currentLang === 'zh' ? '子任务' : 'Task';
-      if (n.type === 'action') return currentLang === 'zh' ? '动作' : 'Action';
+      if (n.type === 'root') return t('type.root');
+      if (n.type === 'task') return t('type.task');
+      if (n.type === 'action') return t('type.action');
       return 'NODE';
     });
 
@@ -1368,6 +1407,11 @@ function drawForceGraph(data) {
       return n.status || "";
     });
 
+  // Initialize tippy once per node to avoid memory leaks
+  nodes.each(function (d) {
+    tippy(this, { content: `<b>${dagreGraph.node(d).type}</b><br>${dagreGraph.node(d).label || d}`, allowHTML: true });
+  });
+
   // 5. 交互：聚焦模式 (Focus Mode)
   nodes.on("mouseenter", function (event, d) {
     const nodeId = d;
@@ -1381,8 +1425,6 @@ function drawForceGraph(data) {
 
     // 变暗所有非相关连线
     links.classed("dimmed", l => !neighbors.has(l.v) || !neighbors.has(l.w));
-
-    tippy(this, { content: `<b>${dagreGraph.node(d).type}</b><br>${dagreGraph.node(d).label || d}`, allowHTML: true });
   }).on("mouseleave", function () {
     // 恢复原状
     nodes.classed("dimmed", false);
@@ -2233,14 +2275,14 @@ function updateLegend() {
                   </div>`;
     });
   } else if (state.view === 'causal') {
-    // 因果图 - 显示节点类型（这些标签保持原样，因为是专业术语）
+    // 因果图 - 显示节点类型
     const causalLegend = {
-      'ConfirmedVulnerability': { color: '#f59e0b', label: currentLang === 'zh' ? '确认漏洞' : 'Confirmed Vuln' },
-      'Vulnerability': { color: '#a855f7', label: currentLang === 'zh' ? '疑似漏洞' : 'Vulnerability' },
-      'Evidence': { color: '#06b6d4', label: currentLang === 'zh' ? '证据' : 'Evidence' },
-      'Hypothesis': { color: '#84cc16', label: currentLang === 'zh' ? '假设' : 'Hypothesis' },
-      'KeyFact': { color: '#fbbf24', label: currentLang === 'zh' ? '关键事实' : 'Key Fact' },
-      'Flag': { color: '#ef4444', label: 'Flag' }
+      'ConfirmedVulnerability': { color: '#f59e0b', label: t('causal.confirmed_vuln') },
+      'Vulnerability': { color: '#a855f7', label: t('causal.vulnerability') },
+      'Evidence': { color: '#06b6d4', label: t('causal.evidence') },
+      'Hypothesis': { color: '#84cc16', label: t('causal.hypothesis') },
+      'KeyFact': { color: '#fbbf24', label: t('causal.keyfact') },
+      'Flag': { color: '#ef4444', label: t('causal.flag') }
     };
     Object.entries(causalLegend).forEach(([k, v]) => {
       h += `<div class="legend-item">
@@ -2276,7 +2318,7 @@ function showDetails(d) {
         <span class="detail-status-badge" style="background:${statusColor}">${statusText}</span>
       </div>
       <div style="display:flex;gap:4px;">
-        <button class="btn btn-chat" onclick="openChatDialog('${d.id}')" title="Chat" style="font-size:11px;padding:2px 8px;">💬</button>
+        <button class="btn btn-chat" onclick="openChatDialog('${escapeHtml(d.id)}')" title="Chat" style="font-size:11px;padding:2px 8px;">💬</button>
       </div>
     </div>
     <div style="font-size:13px;font-weight:bold;word-break:break-word;margin-top:6px;">${d.label || d.description || d.id}</div>
@@ -2341,28 +2383,28 @@ function renderOverviewTab(d) {
     h += `<div style="font-size:12px;color:#f59e0b;font-weight:bold;font-family:monospace;">${escapeHtml(toolName)}</div>`;
     const toolArgs = d.tool_args || (d.action && d.action.params);
     if (toolArgs) {
-      h += `<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">参数:</div><div class="code-block" style="max-height:150px;">${hlJson(toolArgs)}</div>`;
+      h += `<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">${t('panel.params')}:</div><div class="code-block" style="max-height:150px;">${hlJson(toolArgs)}</div>`;
     }
     h += `</div>`;
   }
   // Description
   if (d.description) {
-    h += `<div class="detail-section"><div class="section-title">${t('panel.description') || '描述'}</div>`;
+    h += `<div class="detail-section"><div class="section-title">${t('panel.description')}</div>`;
     h += `<div style="font-size:12px;color:var(--text-main);">${escapeHtml(d.description)}</div></div>`;
   }
   // Goal
   if (d.goal) {
-    h += `<div class="detail-section"><div class="section-title">目标</div>`;
+    h += `<div class="detail-section"><div class="section-title">${t('panel.goal')}</div>`;
     h += `<div style="font-size:12px;color:var(--text-main);">${escapeHtml(d.goal)}</div></div>`;
   }
-  if (!h) h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无概览信息</div>`;
+  if (!h) h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_overview')}</div>`;
   return h;
 }
 
 function renderFindingsTab(d) {
   const findings = d.findings || (d.data && d.data.findings) || [];
   if (!findings || (Array.isArray(findings) && findings.length === 0)) {
-    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无发现数据</div>`;
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_findings')}</div>`;
   }
   // Group by category
   const groups = {};
@@ -2388,7 +2430,7 @@ function renderFindingsTab(d) {
         <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(String(item.detail || item.evidence || '').slice(0, 200))}</div>
       </div>`;
       if (item.confidence !== undefined) {
-        h += `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">置信度: ${(item.confidence * 100).toFixed(0)}%</div>`;
+        h += `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${t('panel.confidence_label')}: ${(item.confidence * 100).toFixed(0)}%</div>`;
       }
     });
     h += `</div>`;
@@ -2399,14 +2441,14 @@ function renderFindingsTab(d) {
 function renderEvidenceTab(d) {
   const evIds = d.evidence_ids || (d.data && d.data.evidence_ids) || [];
   if (!evIds || (Array.isArray(evIds) && evIds.length === 0)) {
-    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无证据关联</div>`;
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_evidence')}</div>`;
   }
-  let h = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">关联证据 (${evIds.length})</div>`;
+  let h = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">${t('panel.evidence_count')} (${evIds.length})</div>`;
   (Array.isArray(evIds) ? evIds : Object.keys(evIds)).forEach(id => {
     h += `<div class="finding-item" style="cursor:pointer;" onclick="showEvidenceDetail('${escapeHtml(id)}')">
       <div class="finding-item-header">
         <span style="font-family:monospace;font-size:11px;">${escapeHtml(id)}</span>
-        <span style="font-size:10px;color:var(--accent-primary);">查看 →</span>
+        <span style="font-size:10px;color:var(--accent-primary);">${t('panel.view')} →</span>
       </div>
     </div>`;
   });
@@ -2416,7 +2458,7 @@ function renderEvidenceTab(d) {
 function renderRawTab(d) {
   const raw = d.observation || (d.data && d.data.raw_output) || d.result;
   if (!raw) {
-    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无原始输出</div>`;
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_raw')}</div>`;
   }
   let content = (typeof raw === 'object') ? JSON.stringify(raw, null, 2) : String(raw);
   // Truncate if too long
@@ -2434,25 +2476,25 @@ function renderSuggestionsTab(d) {
     const cat = (f.category || f.type || '').toLowerCase();
     if (cat) categories.add(cat);
   });
-  let h = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">基于当前发现，建议下一步：</div>';
+  let h = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">' + t('suggestion.header') + '</div>';
   if (categories.size === 0) {
-    h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">暂无足够数据生成建议</div>`;
+    h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('suggestion.no_data')}</div>`;
     return h;
   }
   const suggestionMap = {
-    'open_port': ['对开放端口进行 banner 抓取', '使用 nmap 进行服务版本探测', '检查常见弱口令服务'],
-    'service': ['根据服务版本搜索已知漏洞 (searchsploit)', '尝试使用该服务的默认凭据', '测试服务配置安全性'],
-    'subdomain': ['对发现的子域名进行 HTTP 探测', '对子域名进行端口扫描', '收集子域名的 DNS 记录'],
-    'vuln': ['确认漏洞是否真实可被利用', '尝试搜索公开的漏洞利用代码', '分析漏洞影响范围'],
-    'url': ['对 URL 进行目录扫描 (dirsearch)', '测试常见 Web 漏洞 (SQLi/XSS/SSRF)', '分析页面 JavaScript 和 API 端点'],
-    'http_header': ['检查安全头缺失导致的潜在风险', '分析 CORS 配置安全性', '检查 Cookie 安全属性设置'],
-    'technology': ['根据技术栈搜索已知漏洞', '检查组件版本是否过时', '寻找版本相关的 CVE'],
-    'cms': ['尝试 CMS 指纹识别', '检查 CMS 版本漏洞', '寻找 CMS 后台路径'],
-    'email': ['验证邮箱有效性', '检查邮件服务器配置', '测试邮件注入或 SPF 记录'],
-    'dns': ['检查域名的 DNS 记录', '测试区域传输漏洞', '寻找子域名劫持机会'],
+    'open_port': [t('suggestion.open_port_1'), t('suggestion.open_port_2'), t('suggestion.open_port_3')],
+    'service': [t('suggestion.service_1'), t('suggestion.service_2'), t('suggestion.service_3')],
+    'subdomain': [t('suggestion.subdomain_1'), t('suggestion.subdomain_2'), t('suggestion.subdomain_3')],
+    'vuln': [t('suggestion.vuln_1'), t('suggestion.vuln_2'), t('suggestion.vuln_3')],
+    'url': [t('suggestion.url_1'), t('suggestion.url_2'), t('suggestion.url_3')],
+    'http_header': [t('suggestion.http_header_1'), t('suggestion.http_header_2'), t('suggestion.http_header_3')],
+    'technology': [t('suggestion.technology_1'), t('suggestion.technology_2'), t('suggestion.technology_3')],
+    'cms': [t('suggestion.cms_1'), t('suggestion.cms_2'), t('suggestion.cms_3')],
+    'email': [t('suggestion.email_1'), t('suggestion.email_2'), t('suggestion.email_3')],
+    'dns': [t('suggestion.dns_1'), t('suggestion.dns_2'), t('suggestion.dns_3')],
   };
   categories.forEach(cat => {
-    const suggestions = suggestionMap[cat] || ['根据发现信息进行深入分析', '搜索相关已知漏洞', '尝试扩大攻击面'];
+    const suggestions = suggestionMap[cat] || [t('suggestion.fallback_1'), t('suggestion.fallback_2'), t('suggestion.fallback_3')];
     h += `<div class="finding-group"><div class="finding-group-title">💡 ${escapeHtml(cat.replace(/_/g, ' '))}</div>`;
     suggestions.forEach(s => {
       h += `<div class="suggestion-item">• ${escapeHtml(s)}</div>`;
@@ -2505,11 +2547,11 @@ function renderHypothesisList(hypotheses) {
 
     h += `<div class="finding-item" style="margin-bottom:8px;">
       <div class="finding-item-header" style="margin-bottom:4px;">
-        <span style="font-weight:500;font-size:12px;color:var(--text-main);">${escapeHtml(hy.description || hy.id || '未命名假设')}</span>
+        <span style="font-weight:500;font-size:12px;color:var(--text-main);">${escapeHtml(hy.description || hy.id || t('panel.no_hypothesis'))}</span>
         <span class="ev-cat-tag" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${escapeHtml(status)}</span>
       </div>
       <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
-        <span style="font-size:10px;color:var(--text-muted);">${t('panel.confidence') || '置信度'}</span>
+        <span style="font-size:10px;color:var(--text-muted);">${t('panel.confidence_label')}</span>
         <div style="flex:1;height:6px;background:rgba(100,116,139,0.3);border-radius:3px;overflow:hidden;">
           <div style="width:${(confidence * 100).toFixed(0)}%;height:100%;background:${confColor};border-radius:3px;"></div>
         </div>
@@ -2806,10 +2848,6 @@ function initPanelDrag() {
   });
 }
 
-// 页面加载后初始化拖动
-document.addEventListener('DOMContentLoaded', () => {
-  initPanelDrag();
-});
 
 function subscribe() {
   state.es = new EventSource(`/api/events?op_id=${state.op_id}`);
@@ -2855,7 +2893,7 @@ function subscribe() {
 
 // 专门处理系统/执行事件 (execution.step.completed, graph.changed, etc)
 function renderSystemEvent(msg) {
-  const id = (msg.timestamp || 0) + '_' + msg.event;
+  const id = (msg.timestamp || 0) + '_' + msg.event + '_' + Math.random().toString(36).substr(2, 5);
   if (state.processedEvents.has(id)) return;
   state.processedEvents.add(id);
 
@@ -2933,7 +2971,7 @@ function renderSystemEvent(msg) {
 
 // 专门处理 LLM 响应
 function renderLLMResponse(msg, isHistory = false) {
-  const id = (msg.timestamp || Date.now()) + '_' + msg.event;
+  const id = (msg.timestamp || Date.now()) + '_' + msg.event + '_' + Math.random().toString(36).substr(2, 5);
   if (state.processedEvents.has(id)) return;
   state.processedEvents.add(id);
 
@@ -3048,7 +3086,7 @@ function renderLLMResponse(msg, isHistory = false) {
         ? '#10b981'
         : (normalizedAuditStatus === 'failed' ? '#ef4444' : '#f59e0b');
       htmlContent += `<div class="thought-card" style="border-left-color:${statusColor}">
-              <div class="thought-title" style="color:${statusColor}">Audit: ${escapeHtml(audit.status.toUpperCase())}</div>
+              <div class="thought-title" style="color:${statusColor}">Audit: ${escapeHtml((audit.status || 'UNKNOWN').toUpperCase())}</div>
               <div style="margin-bottom:6px;">${escapeHtml(audit.completion_check || '')}</div>
           </div>`;
       delete remaining.audit_result;
@@ -3093,10 +3131,16 @@ function renderLLMResponse(msg, isHistory = false) {
 
     // Remaining Data Dump (Collapsible)
     if (Object.keys(remaining).length > 0) {
+      let remainingJson;
+      try {
+        remainingJson = JSON.stringify(remaining, null, 2);
+      } catch (e) {
+        remainingJson = '[Object with circular reference]';
+      }
       htmlContent += `
           <div class="log-group">
               <div class="log-summary" onclick="this.parentElement.classList.toggle('open')">Other Data</div>
-              <div class="log-details"><div class="raw-data-content">${hlJson(JSON.stringify(remaining, null, 2))}</div></div>
+              <div class="log-details"><div class="raw-data-content">${hlJson(remainingJson)}</div></div>
           </div>`;
     }
 
@@ -3255,13 +3299,6 @@ function updateHitlLabel() {
   }
 }
 
-// 监听人机协同复选框变化
-document.addEventListener('DOMContentLoaded', () => {
-  const hitlCheckbox = document.getElementById('create-hitl');
-  if (hitlCheckbox) {
-    hitlCheckbox.addEventListener('change', updateHitlLabel);
-  }
-});
 
 // 提交创建任务
 async function submitCreateTask() {
@@ -3582,10 +3619,10 @@ function showNodeContextMenu(nodeId, event) {
   const isZh = (window.currentLang || 'zh') === 'zh';
 
   menu.innerHTML = `
-    <div class="node-context-item" onclick="restartNode('${nodeId}', false); hideNodeContextMenu();">
+    <div class="node-context-item" onclick="restartNode('${escapeHtml(nodeId)}', false); hideNodeContextMenu();">
       ${isZh ? '仅重启此节点' : 'Restart this node only'}
     </div>
-    <div class="node-context-item" onclick="restartNode('${nodeId}', true); hideNodeContextMenu();">
+    <div class="node-context-item" onclick="restartNode('${escapeHtml(nodeId)}', true); hideNodeContextMenu();">
       ${isZh ? '重启此节点及下游' : 'Restart this node & downstream'}
     </div>
   `;

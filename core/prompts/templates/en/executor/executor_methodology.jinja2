@@ -3,6 +3,15 @@
 - Start with the simplest probe; escalate to complex payloads only after initial success.
 - See the tool selection guide below for detailed tool decisions.
 
+### 🛡️ Defensive Programming Constraints
+
+Any script executed via the `python_exec` tool that makes network requests **must** adhere to the following constraints. Scripts violating any constraint are considered incorrect and must be corrected before resubmission:
+
+1. **Status Code Pre-check**: Always check `r.status_code` before reading response body content to confirm the request succeeded.
+2. **JSON Parsing Resilience**: Do not call `r.json()` directly. Wrap it in `try/except json.JSONDecodeError`, and fallback to `r.text` for manual parsing or raw response logging on failure.
+3. **Network Exception Handling**: All `requests` calls must be wrapped in `try/except requests.RequestException` to prevent network errors from crashing the entire script.
+4. **Mandatory Timeout**: All `requests` calls must explicitly set the `timeout` parameter. Requests without a timeout are prohibited.
+
 ### 🧠 Knowledge Retrieval Protocol
 
 When encountering the following situations, you **must** prioritize calling `retrieve_knowledge` rather than guessing blindly:

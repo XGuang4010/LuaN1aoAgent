@@ -3,6 +3,15 @@
 - 优先最简探针，仅在初步成功后升级复杂 payload。
 - 工具选择详见下方工具选择指南。
 
+### 🛡️ 防御性编程约束 (Defensive Programming)
+
+任何通过 `python_exec` 工具编写并执行网络请求的脚本，**必须**遵守以下约束。违反任一约束的脚本将被视为错误，必须修正后重新提交：
+
+1. **状态码前置检查**: 在读取响应体内容之前，必须先检查 `r.status_code`，确认请求成功。
+2. **JSON 解析容错**: 禁止直接调用 `r.json()`。必须使用 `try/except json.JSONDecodeError` 包裹，解析失败时 fallback 到 `r.text` 进行人工解析或记录原始响应片段。
+3. **网络异常捕获**: 所有 `requests` 调用必须使用 `try/except requests.RequestException` 包裹，防止网络错误导致整个脚本崩溃。
+4. **超时强制设置**: 所有 `requests` 调用必须显式设置 `timeout` 参数，禁止无超时请求。
+
 ### 🧠 知识检索协议 (Knowledge Retrieval Protocol)
 
 当遇到以下情况时，**必须**优先调用 `retrieve_knowledge` 工具，而不是盲目尝试：
