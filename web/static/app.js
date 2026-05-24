@@ -3242,6 +3242,11 @@ async function loadScopeDefaults() {
     document.getElementById('scope-disable-shell').checked = !!defaults.disable_shell_exec;
     document.getElementById('scope-disable-python').checked = !!defaults.disable_python_exec;
     document.getElementById('scope-block-private').checked = !!defaults.block_private_network;
+    // 加载扫描类型限制
+    const blockedScanTypes = defaults.blocked_scan_types || [];
+    document.getElementById('scope-block-udp-full').checked = blockedScanTypes.includes('udp_full');
+    document.getElementById('scope-block-tcp-full').checked = blockedScanTypes.includes('tcp_full');
+    document.getElementById('scope-block-udp-syn').checked = blockedScanTypes.includes('udp_syn');
     state.scopePanelOpened = true;
   } catch (e) {
     console.error('Failed to load scope defaults:', e);
@@ -3269,6 +3274,12 @@ function collectScopeConfig() {
   config.disable_shell_exec = document.getElementById('scope-disable-shell').checked;
   config.disable_python_exec = document.getElementById('scope-disable-python').checked;
   config.block_private_network = document.getElementById('scope-block-private').checked;
+  // 收集扫描类型限制
+  const blockedScanTypes = [];
+  if (document.getElementById('scope-block-udp-full').checked) blockedScanTypes.push('udp_full');
+  if (document.getElementById('scope-block-tcp-full').checked) blockedScanTypes.push('tcp_full');
+  if (document.getElementById('scope-block-udp-syn').checked) blockedScanTypes.push('udp_syn');
+  if (blockedScanTypes.length > 0) config.blocked_scan_types = blockedScanTypes;
 
   return config;
 }

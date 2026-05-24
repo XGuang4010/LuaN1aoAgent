@@ -506,7 +506,7 @@
                   placeholder="10.0">
               </div>
             </div>
-            <div style="display:flex;gap:24px;margin-top:12px;">
+            <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap;">
               <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
                 <input type="checkbox" id="scope-disable-shell" class="rounded">
                 <span>禁用 shell_exec</span>
@@ -519,6 +519,23 @@
                 <input type="checkbox" id="scope-block-private" class="rounded">
                 <span>阻止私有网络</span>
               </label>
+            </div>
+            <div style="margin-top:12px;">
+              <label class="block text-xs text-gray-500 mb-2">禁止扫描类型</label>
+              <div class="flex gap-4 flex-wrap">
+                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                  <input type="checkbox" id="scope-block-udp-full" class="rounded" value="udp_full">
+                  <span>UDP 全端口</span>
+                </label>
+                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                  <input type="checkbox" id="scope-block-tcp-full" class="rounded" value="tcp_full">
+                  <span>TCP 全端口</span>
+                </label>
+                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                  <input type="checkbox" id="scope-block-udp-syn" class="rounded" value="udp_syn">
+                  <span>UDP SYN</span>
+                </label>
+              </div>
             </div>
           </div>
         </div>

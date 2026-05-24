@@ -27,6 +27,18 @@ from typing import Dict, Any, List, Optional
 from http.server import BaseHTTPRequestHandler
 import sys
 import os
+
+# 加载项目根目录的 .env，确保 TOOLS_HOME 等配置在 MCP 子进程中可用
+# MCP 服务作为独立子进程启动，可能无法继承父进程的环境变量
+try:
+    from dotenv import load_dotenv
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    dotenv_path = os.path.join(project_root, ".env")
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path, override=True)
+except Exception:
+    pass  # dotenv 未安装或 .env 不存在时静默继续
+
 import threading
 from collections import deque
 import httpx
@@ -595,6 +607,26 @@ async def shell_exec(command: str, ctx: Context = None) -> str:
     validator = _get_validator_from_context(ctx)
     if validator and validator.scope.disable_shell_exec:
         return json.dumps({"success": False, "error": "shell_exec 已被边界策略禁用", "rule": "disable_shell_exec"})
+
+    # Windows 兼容性预检
+    import sys
+    is_windows = sys.platform == "win32"
+    if is_windows:
+        linux_only_patterns = {
+            "sudo ": "Windows does not support 'sudo'. Run without privilege elevation or use appropriate Windows methods.",
+            "which ": "Windows uses 'where' instead of 'which'.",
+            "; ": "Windows cmd.exe does not support ';' command chaining. Use '&' or run commands separately.",
+        }
+        for pattern, hint in linux_only_patterns.items():
+            if pattern in command:
+                return json.dumps({
+                    "success": False,
+                    "output": "",
+                    "error_type": "PLATFORM_INCOMPATIBLE",
+                    "message": f"Command contains Linux-specific syntax '{pattern.strip()}' which is not supported on Windows.",
+                    "fix_suggestion": hint + " Alternatively, use the dedicated MCP tools (nmap_scan, dirsearch_scan, etc.) instead of shell_exec.",
+                })
+
     output_lines = []
     try:
         process = await asyncio.create_subprocess_shell(
@@ -626,6 +658,9 @@ async def shell_exec(command: str, ctx: Context = None) -> str:
             elif "Only 1 -p option allowed" in full_output:
                 error_type = "SYNTAX"
                 fix_suggestion = "Incorrect command syntax. Review the tool's help or manual for correct usage."
+            elif is_windows and "'" in command and '"' in command:
+                error_type = "SYNTAX"
+                fix_suggestion = "Windows cmd.exe has complex quote handling. Prefer using dedicated MCP tools over shell_exec for tool invocation."
 
             return json.dumps(
                 {
@@ -836,41 +871,42 @@ async def sqlmap_tool(
     Returns:
         JSON string containing the execution result (stdout/stderr).
     """
-    cmd = ["sqlmap"]
-    
-    if url:
-        cmd.extend(["-u", url])
-    elif raw_request_file:
-        cmd.extend(["-r", raw_request_file])
-    else:
-        return json.dumps({"success": False, "error": "Either 'url' or 'raw_request_file' must be provided."}, ensure_ascii=False)
-        
-    # Basic non-interactive settings
-    cmd.extend(["--batch", "--random-agent"])
-    
-    if tamper:
-        cmd.extend(["--tamper", tamper])
-    
-    if level and 1 <= level <= 5:
-        cmd.extend(["--level", str(level)])
-    
-    if risk and 1 <= risk <= 3:
-        cmd.extend(["--risk", str(risk)])
-        
-    if dbms:
-        cmd.extend(["--dbms", dbms])
-        
-    if extra_args:
-        # Simple splitting, be careful with quotes in extra_args if manually passed
-        # Ideally, we should use shlex.split but we'll keep it simple for now or assume lists
-        import shlex
-        cmd.extend(shlex.split(extra_args))
-
-    # Add output directory to capture results if needed, but for now we rely on stdout
-    # Or we could force it to dump to a specific directory we can read back.
-    # For MCP simple usage, stdout is primary.
-
     try:
+        tool_path = _resolve_tool_path("sqlmap", "SQLMAP_PATH", "sqlmap/sqlmap.exe")
+        cmd = [tool_path]
+        
+        if url:
+            cmd.extend(["-u", url])
+        elif raw_request_file:
+            cmd.extend(["-r", raw_request_file])
+        else:
+            return json.dumps({"success": False, "error": "Either 'url' or 'raw_request_file' must be provided."}, ensure_ascii=False)
+            
+        # Basic non-interactive settings
+        cmd.extend(["--batch", "--random-agent"])
+        
+        if tamper:
+            cmd.extend(["--tamper", tamper])
+        
+        if level and 1 <= level <= 5:
+            cmd.extend(["--level", str(level)])
+        
+        if risk and 1 <= risk <= 3:
+            cmd.extend(["--risk", str(risk)])
+            
+        if dbms:
+            cmd.extend(["--dbms", dbms])
+            
+        if extra_args:
+            # Simple splitting, be careful with quotes in extra_args if manually passed
+            # Ideally, we should use shlex.split but we'll keep it simple for now or assume lists
+            import shlex
+            cmd.extend(shlex.split(extra_args))
+
+        # Add output directory to capture results if needed, but for now we rely on stdout
+        # Or we could force it to dump to a specific directory we can read back.
+        # For MCP simple usage, stdout is primary.
+
         # Run sqlmap
         logger.info(f"Executing sqlmap command: {' '.join(cmd)}")
         process = await asyncio.create_subprocess_exec(
@@ -936,14 +972,16 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
                 filtered_args.append(arg)
             i += 1
     
-    cmd = f"dirsearch -u {url} -e {extensions} -q"
-    if filtered_args:
-        cmd += " " + " ".join(filtered_args)
-
     output_lines = []
     try:
-        process = await asyncio.create_subprocess_shell(
-            cmd,
+        tool_path = _resolve_tool_path("dirsearch", "DIRSEARCH_PATH", "dirsearch/dirsearch.exe")
+        # 使用列表传参避免 shell 注入和 Windows 路径解析问题
+        cmd_parts = [tool_path, "-u", url, "-e", extensions, "-q"]
+        if filtered_args:
+            cmd_parts.extend(filtered_args)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd_parts,
             stdout=asyncio.subprocess.PIPE, 
             stderr=asyncio.subprocess.STDOUT
         )
@@ -2159,8 +2197,9 @@ async def nuclei_scan(
     
     try:
         # 构建 nuclei 命令
+        tool_path = _resolve_tool_path("nuclei", "NUCLEI_PATH", "nuclei/nuclei.exe")
         cmd = [
-            "nuclei",
+            tool_path,
             "-u", target,
             "-jsonl",  # JSON Lines 输出
             "-silent",  # 减少噪音
@@ -2283,7 +2322,8 @@ async def nuclei_list_templates(
     
     try:
         # 构建命令
-        cmd = ["nuclei", "-tl"]  # template list
+        tool_path = _resolve_tool_path("nuclei", "NUCLEI_PATH", "nuclei/nuclei.exe")
+        cmd = [tool_path, "-tl"]  # template list
         
         if tags:
             cmd.extend(["-tags", tags])
@@ -2335,10 +2375,16 @@ async def nuclei_list_templates(
 
 def _resolve_tool_path(tool_name: str, env_var: str, default_subpath: str = None) -> str:
     """解析外部工具路径（三层优先级）。"""
+    import os
+
     # 1. 单工具环境变量
     path = os.environ.get(env_var)
     if path:
-        return path
+        if os.path.exists(path):
+            return path
+        # 环境变量可能指向无 .exe 后缀的路径，尝试补充
+        if not path.endswith(".exe") and os.path.exists(path + ".exe"):
+            return path + ".exe"
 
     # 2. TOOLS_HOME 约定路径
     tools_home = os.environ.get("TOOLS_HOME")
@@ -2347,9 +2393,10 @@ def _resolve_tool_path(tool_name: str, env_var: str, default_subpath: str = None
         if os.path.exists(candidate):
             return candidate
         # 尝试 .exe 后缀（Windows）
-        candidate_exe = candidate + ".exe"
-        if os.path.exists(candidate_exe):
-            return candidate_exe
+        if not candidate.endswith(".exe"):
+            candidate_exe = candidate + ".exe"
+            if os.path.exists(candidate_exe):
+                return candidate_exe
 
     # 3. 直接失败：不依赖系统 PATH 兜底，未配置时明确报错
     raise FileNotFoundError(
@@ -2514,10 +2561,14 @@ async def nmap_scan(target: str, ports: str = "1-65535", args: str = "-sV") -> s
     output_lines: List[str] = []
     try:
         tool_path = _resolve_tool_path("nmap", "NMAP_PATH", "nmap/nmap.exe")
-        cmd = f"{tool_path} -p {ports} {args} {target}"
+        # 使用列表传参避免 shell 注入和 Windows 路径解析问题
+        cmd_parts = [tool_path, "-p", ports]
+        if args:
+            cmd_parts.extend(args.split())
+        cmd_parts.append(target)
 
-        process = await asyncio.create_subprocess_shell(
-            cmd,
+        process = await asyncio.create_subprocess_exec(
+            *cmd_parts,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -2538,6 +2589,12 @@ async def nmap_scan(target: str, ports: str = "1-65535", args: str = "-sV") -> s
             if "not found" in full_output or "No such file or directory" in full_output:
                 error_type = "MISSING_TOOL"
                 fix_suggestion = "nmap is not installed or not in PATH."
+            elif "requires root privileges" in full_output or "requires admin privileges" in full_output:
+                error_type = "PERMISSION"
+                fix_suggestion = "UDP scan (-sU) or SYN scan (-sS) requires administrator/root privileges on this system. Try -sT (TCP connect scan) or run with elevated privileges."
+            elif "Only root" in full_output:
+                error_type = "PERMISSION"
+                fix_suggestion = "This scan type requires administrator/root privileges. Try -sT (TCP connect scan) or run with elevated privileges."
             return json.dumps({
                 "success": False,
                 "output": full_output,
@@ -2578,23 +2635,25 @@ async def httpx_scan(urls: str, args: str = "-title -tech -status-code") -> str:
     output_lines: List[str] = []
     try:
         tool_path = _resolve_tool_path("httpx", "HTTPX_PATH", "httpx/httpx.exe")
-        # Pipe URLs via stdin
-        cmd = f"echo {urls} | {tool_path} {args}"
+        # 使用列表传参避免 shell 注入和 Windows 路径解析问题
+        cmd_parts = [tool_path]
+        if args:
+            cmd_parts.extend(args.split())
 
-        process = await asyncio.create_subprocess_shell(
-            cmd,
+        # 通过 stdin 传递 URL 列表
+        process = await asyncio.create_subprocess_exec(
+            *cmd_parts,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
 
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                break
-            decoded = line.decode("utf-8", errors="replace")
-            output_lines.append(decoded)
+        # 写入 URLs 到 stdin
+        stdin_data = urls.encode("utf-8")
+        stdout, _ = await process.communicate(input=stdin_data)
+        output_lines.append(stdout.decode("utf-8", errors="replace"))
 
-        return_code = await process.wait()
+        return_code = process.returncode
         full_output = "".join(output_lines)
 
         if return_code != 0:

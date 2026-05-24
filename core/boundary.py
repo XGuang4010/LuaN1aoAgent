@@ -23,6 +23,7 @@ class ScopeConfig:
     max_response_size: int = 50000
     rate_limit_requests_per_sec: float = 10.0
     max_concurrent_connections: int = 20
+    blocked_scan_types: List[str] = field(default_factory=lambda: ["udp_full", "tcp_full"])
 
     @classmethod
     def from_global_config(cls, overrides: Optional[Dict] = None) -> 'ScopeConfig':
@@ -47,6 +48,7 @@ class ScopeConfig:
             "max_response_size": self.max_response_size,
             "rate_limit_requests_per_sec": self.rate_limit_requests_per_sec,
             "max_concurrent_connections": self.max_concurrent_connections,
+            "blocked_scan_types": self.blocked_scan_types,
         }
 
     def to_prompt_context(self) -> str:
@@ -56,6 +58,8 @@ class ScopeConfig:
         lines.append(f"- 允许端口: {', '.join(map(str, self.allowed_ports))}")
         if self.disabled_tools:
             lines.append(f"- 禁用工具: {', '.join(self.disabled_tools)}")
+        if self.blocked_scan_types:
+            lines.append(f"- 禁止扫描类型: {', '.join(self.blocked_scan_types)}")
         if self.disable_shell_exec:
             lines.append("- ⚠️ shell_exec 已禁用")
         if self.disable_python_exec:
@@ -98,7 +102,13 @@ class BoundaryValidator:
             if not result.allowed:
                 return result
         
-        # 4. 速率限制检查
+        # 4. 扫描类型限制（针对 nmap_scan）
+        if tool_name == "nmap_scan" and self.scope.blocked_scan_types:
+            result = self._check_blocked_scan_types(params)
+            if not result.allowed:
+                return result
+        
+        # 5. 速率限制检查
         result = self._check_rate_limit()
         if not result.allowed:
             return result
@@ -210,6 +220,36 @@ class BoundaryValidator:
         if re.match(f"^{regex}$", host):
             return True
         return False
+
+    def _check_blocked_scan_types(self, params: Dict) -> BoundaryCheckResult:
+        """检查 nmap_scan 参数是否包含被禁止的扫描类型。"""
+        args = params.get("args", "")
+        ports = params.get("ports", "")
+        args_lower = str(args).lower()
+        ports_str = str(ports)
+
+        # udp_full: UDP 全端口扫描
+        if "udp_full" in self.scope.blocked_scan_types:
+            if "-su" in args_lower or "-sU" in str(args):
+                if "1-65535" in ports_str or ports_str == "1-65535":
+                    return BoundaryCheckResult(
+                        False,
+                        "UDP 全端口扫描 (-sU -p 1-65535) 已被禁止",
+                        "blocked_scan_types",
+                        {"blocked": "udp_full", "args": args, "ports": ports}
+                    )
+
+        # tcp_full: TCP 全端口扫描
+        if "tcp_full" in self.scope.blocked_scan_types:
+            if "1-65535" in ports_str or ports_str == "1-65535":
+                return BoundaryCheckResult(
+                    False,
+                    "TCP 全端口扫描 (-p 1-65535) 已被禁止，请使用常用端口范围",
+                    "blocked_scan_types",
+                    {"blocked": "tcp_full", "ports": ports}
+                )
+
+        return BoundaryCheckResult(True)
 
     def _check_rate_limit(self) -> BoundaryCheckResult:
         import time

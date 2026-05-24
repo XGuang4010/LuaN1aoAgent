@@ -320,6 +320,7 @@ def _build_scope_defaults() -> dict:
         "max_response_size": 50000,
         "rate_limit_requests_per_sec": 10.0,
         "max_concurrent_connections": 20,
+        "blocked_scan_types": ["udp_full", "tcp_full"],
     }
 
     def _merge_with_env(key, toml_val, fallback_val):
@@ -327,7 +328,7 @@ def _build_scope_defaults() -> dict:
         env_key = f"SCOPE_{key.upper()}"  # blocked_targets → SCOPE_BLOCKED_TARGETS
         env_val = os.getenv(env_key)
 
-        if key in ("blocked_targets", "allowed_targets", "disabled_tools"):
+        if key in ("blocked_targets", "allowed_targets", "disabled_tools", "blocked_scan_types"):
             # 列表类: 环境变量用逗号分隔
             if env_val is not None:
                 return [v.strip() for v in env_val.split(",") if v.strip()]
