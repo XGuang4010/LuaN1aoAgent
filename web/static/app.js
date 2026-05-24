@@ -3578,6 +3578,65 @@ function toggleLeftSidebar() {
   });
 }
 
+// Sidebar resize handle logic
+(function initSidebarResizer() {
+  const SIDEBAR_MIN_WIDTH = 180;
+  const SIDEBAR_MAX_WIDTH = 600;
+  const STORAGE_KEY = 'sidebar_width';
+
+  function setupResizer() {
+    const resizer = document.getElementById('sidebar-resizer');
+    const sidebar = document.getElementById('sidebar');
+    if (!resizer || !sidebar) return;
+
+    let startX = 0;
+    let startWidth = 0;
+
+    function onMouseMove(e) {
+      const dx = e.clientX - startX;
+      let newWidth = startWidth + dx;
+      newWidth = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, newWidth));
+      sidebar.style.width = newWidth + 'px';
+      sidebar.style.minWidth = newWidth + 'px';
+    }
+
+    function onMouseUp() {
+      resizer.classList.remove('resizing');
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      const width = parseInt(sidebar.style.width, 10);
+      if (width) {
+        localStorage.setItem(STORAGE_KEY, String(width));
+      }
+    }
+
+    resizer.addEventListener('mousedown', (e) => {
+      if (sidebar.classList.contains('collapsed')) return;
+      startX = e.clientX;
+      startWidth = sidebar.offsetWidth;
+      resizer.classList.add('resizing');
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+    });
+
+    // Restore saved width on init
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const width = parseInt(saved, 10);
+      if (width >= SIDEBAR_MIN_WIDTH && width <= SIDEBAR_MAX_WIDTH) {
+        sidebar.style.width = width + 'px';
+        sidebar.style.minWidth = width + 'px';
+      }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupResizer);
+  } else {
+    setupResizer();
+  }
+})();
+
 // Toggle right sidebar (Agent Logs)
 function toggleRightSidebar() {
   state.rightSidebarCollapsed = !state.rightSidebarCollapsed;
