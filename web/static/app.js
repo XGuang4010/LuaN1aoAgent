@@ -3598,12 +3598,17 @@ function toggleLeftSidebar() {
       newWidth = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, newWidth));
       sidebar.style.width = newWidth + 'px';
       sidebar.style.minWidth = newWidth + 'px';
+      sidebar.style.flexBasis = newWidth + 'px';
+      sidebar.style.maxWidth = newWidth + 'px';
+      // Prevent text selection while dragging
+      e.preventDefault();
     }
 
     function onMouseUp() {
       resizer.classList.remove('resizing');
       document.removeEventListener('mousemove', onMouseMove);
       document.removeEventListener('mouseup', onMouseUp);
+      document.body.style.userSelect = '';
       const width = parseInt(sidebar.style.width, 10);
       if (width) {
         localStorage.setItem(STORAGE_KEY, String(width));
@@ -3612,9 +3617,11 @@ function toggleLeftSidebar() {
 
     resizer.addEventListener('mousedown', (e) => {
       if (sidebar.classList.contains('collapsed')) return;
+      e.preventDefault();
       startX = e.clientX;
       startWidth = sidebar.offsetWidth;
       resizer.classList.add('resizing');
+      document.body.style.userSelect = 'none';
       document.addEventListener('mousemove', onMouseMove);
       document.addEventListener('mouseup', onMouseUp);
     });
@@ -3626,6 +3633,8 @@ function toggleLeftSidebar() {
       if (width >= SIDEBAR_MIN_WIDTH && width <= SIDEBAR_MAX_WIDTH) {
         sidebar.style.width = width + 'px';
         sidebar.style.minWidth = width + 'px';
+        sidebar.style.flexBasis = width + 'px';
+        sidebar.style.maxWidth = width + 'px';
       }
     }
   }
