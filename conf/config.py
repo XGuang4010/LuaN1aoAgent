@@ -3,10 +3,35 @@
 # 注意：请勿将真实API密钥提交到版本控制系统
 
 import os
+import sys
+from pathlib import Path
 from dotenv import load_dotenv
 
 # 从.env文件加载环境变量
 load_dotenv()
+
+# Python 3.11+ 内置 tomllib，无需额外依赖
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None  # 无 TOML 支持时回退到默认值
+
+
+def _load_scope_toml() -> dict:
+    """从 conf/scope_defaults.toml 加载默认 scope 配置。"""
+    defaults = {}
+    if tomllib is not None:
+        toml_path = Path(__file__).parent / "scope_defaults.toml"
+        if toml_path.is_file():
+            try:
+                with open(toml_path, "rb") as f:
+                    defaults = tomllib.load(f)
+            except Exception:
+                pass  # 解析失败时使用下方硬编码回退值
+    return defaults
 
 # ============================================================================
 # 核心场景配置 (Scenario Configuration)
@@ -192,6 +217,9 @@ TOOL_TIMEOUTS: dict = {
 # 执行器观察结果的最大长度（字符），超过此长度将被截断
 EXECUTOR_MAX_OUTPUT_LENGTH = int(os.getenv("EXECUTOR_MAX_OUTPUT_LENGTH", "50000"))
 
+# 执行器观察结果的 DB 存储最大长度（字符），超过此长度时在 DB 层截断
+EXECUTOR_DB_OUTPUT_LENGTH = int(os.getenv("EXECUTOR_DB_OUTPUT_LENGTH", "200000"))
+
 # P-E-R 全局循环最大次数（防止无限循环）
 GLOBAL_MAX_CYCLES = int(os.getenv("GLOBAL_MAX_CYCLES", "50"))
 
@@ -253,3 +281,111 @@ KNOWLEDGE_SERVICE_URL = os.getenv("KNOWLEDGE_SERVICE_URL", f"http://{KNOWLEDGE_S
 # 是否开启人工介入模式
 # 开启后，Agent在生成规划后会暂停，等待Web UI或CLI的人工审批
 HUMAN_IN_THE_LOOP = os.getenv("HUMAN_IN_THE_LOOP", "false").lower() == "true"
+
+# ============================================================================
+# 作用域配置 (Scope Configuration)
+# ============================================================================
+# 加载顺序: scope_defaults.toml (底层默认值) → .env 环境变量 (覆盖) → 任务级配置 (最高优先级)
+#
+# 每个字段对应一个同名环境变量，使用 SCOPE_ 前缀 + 大写下划线命名:
+#   blocked_targets        → SCOPE_BLOCKED_TARGETS (逗号分隔字符串)
+#   allowed_ports          → SCOPE_ALLOWED_PORTS (逗号分隔数字)
+#   allowed_targets        → SCOPE_ALLOWED_TARGETS
+#   disabled_tools         → SCOPE_DISABLED_TOOLS
+#   disable_shell_exec     → SCOPE_DISABLE_SHELL_EXEC ("true"/"false")
+#   disable_python_exec    → SCOPE_DISABLE_PYTHON_EXEC ("true"/"false")
+#   block_private_network  → SCOPE_BLOCK_PRIVATE_NETWORK ("true"/"false")
+#   block_dns_rebinding    → SCOPE_BLOCK_DNS_REBINDING ("true"/"false")
+#   enforce_tls_verification → SCOPE_ENFORCE_TLS_VERIFICATION ("true"/"false")
+#   max_response_size      → SCOPE_MAX_RESPONSE_SIZE
+#   rate_limit_requests_per_sec → SCOPE_RATE_LIMIT_RPS
+#   max_concurrent_connections  → SCOPE_MAX_CONCURRENT_CONNECTIONS
+
+def _build_scope_defaults() -> dict:
+    """组装 SCOPE_DEFAULTS: TOML defaults → 环境变量覆盖."""
+    _toml = _load_scope_toml()
+
+    # 硬编码回退值（当 TOML 缺失 / 无 tomllib 时使用）
+    _fallback = {
+        "blocked_targets": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+                            "127.0.0.0/8", "169.254.0.0/16", "0.0.0.0/8"],
+        "allowed_ports": [80, 443, 8080, 8443],
+        "allowed_targets": ["*"],
+        "disabled_tools": [],
+        "disable_shell_exec": False,
+        "disable_python_exec": False,
+        "block_private_network": True,
+        "block_dns_rebinding": True,
+        "enforce_tls_verification": True,
+        "max_response_size": 50000,
+        "rate_limit_requests_per_sec": 10.0,
+        "max_concurrent_connections": 20,
+        "blocked_scan_types": ["udp_full", "tcp_full"],
+    }
+
+    def _merge_with_env(key, toml_val, fallback_val):
+        """单个 key 的值合并: 环境变量优先 > TOML > fallback."""
+        env_key = f"SCOPE_{key.upper()}"  # blocked_targets → SCOPE_BLOCKED_TARGETS
+        env_val = os.getenv(env_key)
+
+        if key in ("blocked_targets", "allowed_targets", "disabled_tools", "blocked_scan_types"):
+            # 列表类: 环境变量用逗号分隔
+            if env_val is not None:
+                return [v.strip() for v in env_val.split(",") if v.strip()]
+            if toml_val is not None:
+                return list(toml_val)
+            return list(fallback_val)
+
+        if key == "allowed_ports":
+            if env_val is not None:
+                return [int(p.strip()) for p in env_val.split(",") if p.strip()]
+            if toml_val is not None:
+                return [int(p) for p in toml_val]
+            return list(fallback_val)
+
+        if key in ("disable_shell_exec", "disable_python_exec",
+                   "block_private_network", "block_dns_rebinding",
+                   "enforce_tls_verification"):
+            # 布尔类
+            if env_val is not None:
+                return env_val.lower() == "true"
+            if toml_val is not None:
+                return bool(toml_val)
+            return bool(fallback_val)
+
+        if key == "rate_limit_requests_per_sec":
+            if env_val is not None:
+                return float(env_val)
+            if toml_val is not None:
+                return float(toml_val)
+            return float(fallback_val)
+
+        if key == "max_response_size":
+            if env_val is not None:
+                return int(env_val)
+            if toml_val is not None:
+                return int(toml_val)
+            return int(fallback_val)
+
+        if key == "max_concurrent_connections":
+            if env_val is not None:
+                return int(env_val)
+            if toml_val is not None:
+                return int(toml_val)
+            return int(fallback_val)
+
+        # 兜底
+        if env_val is not None:
+            return env_val
+        if toml_val is not None:
+            return toml_val
+        return fallback_val
+
+    result = {}
+    for key in _fallback:
+        result[key] = _merge_with_env(key, _toml.get(key), _fallback[key])
+
+    return result
+
+
+SCOPE_DEFAULTS = _build_scope_defaults()

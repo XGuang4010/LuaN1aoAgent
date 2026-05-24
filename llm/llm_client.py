@@ -183,8 +183,8 @@ class LLMClient:
             if thinking_mode in ["hidden", "visible"]:
                 payload["extra_body"] = {"thinking": thinking_mode}
 
-        # 强制 JSON 输出
-        if expect_json:
+        # 强制 JSON 输出（排除 GLM 系列模型，其对 response_format 支持不兼容）
+        if expect_json and not model_name.startswith("glm-"):
             payload["response_format"] = {"type": "json_object"}
 
         return headers, payload

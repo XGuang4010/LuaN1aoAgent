@@ -16,7 +16,146 @@
   <script src="https://unpkg.com/tippy.js@6"></script>
   <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/dist/tippy.css" />
   <link rel="stylesheet" href="https://unpkg.com/tippy.js@6/themes/light.css" />
-  <link rel="stylesheet" href="/static/style.css?v=20241224v2" />
+  <link rel="stylesheet" href="/static/style.css?v=20260524v1" />
+  <style>
+    /* ===== Tab Styles ===== */
+    .tab-bar { display:flex; gap:2px; padding:8px 0; border-bottom:1px solid var(--border-color); margin-bottom:10px; }
+    .tab-btn { font-size:11px; padding:4px 12px; background:transparent; color:var(--text-muted); border:1px solid transparent; border-radius:4px 4px 0 0; cursor:pointer; transition:all 0.15s; white-space:nowrap; }
+    .tab-btn:hover { background:rgba(59,130,246,0.1); color:var(--text-main); }
+    .tab-btn.active { background:rgba(59,130,246,0.15); color:var(--accent-primary); border-color:var(--accent-primary); border-bottom-color:var(--accent-primary); font-weight:600; }
+    .tab-pane { display:none; }
+    .tab-pane.active { display:block; }
+
+    .detail-header-bar { margin-bottom:8px; padding-bottom:8px; border-bottom:1px solid var(--border-color); }
+    .detail-type-badge { display:inline-block; font-size:10px; font-weight:bold; padding:2px 8px; border-radius:4px; margin-right:6px; }
+    .detail-status-badge { display:inline-block; font-size:10px; font-weight:bold; padding:2px 8px; border-radius:4px; color:#fff; }
+    .section-title { font-size:11px; font-weight:600; color:var(--accent-primary); text-transform:uppercase; margin-bottom:6px; letter-spacing:0.5px; }
+    .detail-section { margin-bottom:12px; }
+
+    /* ===== Finding Group ===== */
+    .finding-group { margin-bottom:10px; border:1px solid var(--border-color); border-radius:6px; overflow:hidden; }
+    .finding-group-title { font-size:11px; font-weight:600; padding:8px 10px; background:rgba(59,130,246,0.08); color:var(--accent-primary); text-transform:capitalize; border-bottom:1px solid var(--border-color); }
+    .finding-item { padding:8px 10px; border-bottom:1px solid rgba(100,116,139,0.15); transition:background 0.15s; }
+    .finding-item:last-child { border-bottom:none; }
+    .finding-item:hover { background:rgba(59,130,246,0.05); }
+    .finding-item-header { display:flex; justify-content:space-between; align-items:center; }
+    .suggestion-item { font-size:12px; color:var(--text-main); padding:4px 10px 4px 20px; line-height:1.5; }
+
+    /* ===== Chat Dialog ===== */
+    .chat-dialog { display:none; position:fixed; bottom:20px; right:20px; width:380px; height:500px; flex-direction:column; background:var(--bg-sidebar); border:1px solid var(--border-color); border-radius:12px; box-shadow:0 8px 32px rgba(0,0,0,0.4); z-index:1000; overflow:hidden; }
+    .chat-header { display:flex; justify-content:space-between; align-items:center; padding:12px 16px; background:var(--accent-primary); color:#fff; font-weight:600; font-size:13px; }
+    .chat-close-btn { background:rgba(255,255,255,0.2); border:none; color:#fff; width:24px; height:24px; border-radius:4px; cursor:pointer; font-size:12px; display:flex; align-items:center; justify-content:center; }
+    .chat-close-btn:hover { background:rgba(255,255,255,0.3); }
+    .chat-messages { flex:1; overflow-y:auto; padding:12px; display:flex; flex-direction:column; gap:8px; background:var(--bg-app); }
+    .chat-msg { max-width:85%; padding:8px 12px; border-radius:8px; font-size:12px; line-height:1.5; word-break:break-word; }
+    .chat-msg.system-msg { align-self:flex-start; background:rgba(59,130,246,0.1); color:var(--text-muted); border:1px solid rgba(59,130,246,0.2); }
+    .chat-msg.user-msg { align-self:flex-end; background:var(--accent-primary); color:#fff; }
+    .chat-msg.assist-msg { align-self:flex-start; background:var(--bg-sidebar); color:var(--text-main); border:1px solid var(--border-color); }
+    .chat-quick-qs { display:flex; gap:4px; padding:8px 12px; border-top:1px solid var(--border-color); background:var(--bg-app); }
+    .chat-q-btn { flex:1; font-size:10px; padding:4px 6px; background:rgba(59,130,246,0.1); color:var(--accent-primary); border:1px solid rgba(59,130,246,0.2); border-radius:4px; cursor:pointer; white-space:nowrap; }
+    .chat-q-btn:hover { background:rgba(59,130,246,0.2); }
+    .chat-input-area { display:flex; gap:6px; padding:8px 12px; border-top:1px solid var(--border-color); background:var(--bg-app); }
+    .chat-input-area input { flex:1; padding:6px 10px; font-size:12px; background:var(--bg-input); color:var(--text-main); border:1px solid var(--border-color); border-radius:6px; outline:none; }
+    .chat-input-area input:focus { border-color:var(--accent-primary); }
+    .chat-send-btn { padding:6px 14px; font-size:12px; background:var(--accent-primary); color:#fff; border:none; border-radius:6px; cursor:pointer; font-weight:500; }
+    .chat-send-btn:hover { opacity:0.9; }
+
+    /* ===== Evidence View ===== */
+    #evidence-view { display:none; position:absolute; top:0; left:0; right:0; bottom:0; flex-direction:column; background:var(--bg-app); z-index:50; }
+    .ev-toolbar { display:flex; justify-content:space-between; align-items:center; padding:8px 16px; background:var(--bg-sidebar); border-bottom:1px solid var(--border-color); }
+    .ev-title { font-weight:600; font-size:13px; color:var(--accent-primary); }
+    .ev-body { flex:1; display:flex; overflow:hidden; }
+    .ev-filter { flex:0 0 280px; padding:12px; border-right:1px solid var(--border-color); background:var(--bg-sidebar); display:flex; flex-direction:column; gap:8px; }
+    .ev-filter input, .ev-filter select { padding:6px 10px; font-size:12px; background:var(--bg-input); color:var(--text-main); border:1px solid var(--border-color); border-radius:6px; outline:none; }
+    .ev-filter input:focus, .ev-filter select:focus { border-color:var(--accent-primary); }
+    .ev-list { flex:0 0 320px; overflow-y:auto; border-right:1px solid var(--border-color); padding:8px; background:var(--bg-app); }
+    .ev-detail { flex:1; overflow-y:auto; padding:16px; background:var(--bg-app); }
+    .ev-list-item { padding:8px 10px; border:1px solid var(--border-color); border-radius:6px; margin-bottom:6px; cursor:pointer; transition:all 0.15s; }
+    .ev-list-item:hover { border-color:var(--accent-primary); background:rgba(59,130,246,0.05); }
+    .ev-list-item-header { display:flex; align-items:center; gap:6px; margin-bottom:2px; }
+    .ev-cat-tag { display:inline-block; font-size:9px; font-weight:600; padding:1px 6px; border-radius:3px; text-transform:uppercase; white-space:nowrap; }
+    .ev-detail-section { margin-bottom:16px; padding:12px; background:var(--bg-sidebar); border:1px solid var(--border-color); border-radius:8px; }
+
+    /* ===== Causal Chain ===== */
+    .causal-chain { display:flex; flex-direction:column; align-items:center; gap:4px; padding:12px; background:rgba(15,23,42,0.5); border-radius:6px; }
+    .causal-chain-node { display:flex; align-items:center; gap:8px; padding:8px 12px; background:var(--bg-app); border:2px solid; border-radius:6px; min-width:140px; }
+    .causal-chain-arrow { font-size:16px; color:var(--text-muted); line-height:1; }
+
+    /* ===== Hypothesis Panel ===== */
+    .hypothesis-item { margin-bottom:10px; border:1px solid var(--border-color); border-radius:6px; overflow:hidden; }
+    .hypothesis-header { display:flex; justify-content:space-between; align-items:center; padding:8px 10px; background:rgba(132,204,22,0.08); border-bottom:1px solid var(--border-color); }
+    .hypothesis-status { display:inline-block; font-size:9px; font-weight:700; padding:2px 8px; border-radius:4px; text-transform:uppercase; }
+    .hypothesis-desc { padding:8px 10px; font-size:12px; color:var(--text-main); line-height:1.5; }
+    .hypothesis-confidence { display:flex; align-items:center; gap:6px; padding:6px 10px; background:rgba(15,23,42,0.5); }
+    .confidence-bar { flex:1; height:6px; background:rgba(100,116,139,0.3); border-radius:3px; overflow:hidden; }
+    .confidence-fill { height:100%; border-radius:3px; }
+
+    /* ===== Causal Link Animation ===== */
+    @keyframes flow { from { stroke-dashoffset: 10; } to { stroke-dashoffset: 0; } }
+    .causal-link { stroke-dasharray: 5 5; animation: flow 1s linear infinite; }
+
+    /* ===== Node Context Menu ===== */
+    .node-context-menu { position:absolute; background:var(--bg-sidebar); border:1px solid var(--border-color); border-radius:6px; padding:4px 0; box-shadow:0 4px 12px rgba(0,0,0,0.3); z-index:1000; min-width:160px; }
+    .node-context-item { padding:8px 16px; cursor:pointer; font-size:13px; color:var(--text-main); transition:background 0.15s; }
+    .node-context-item:hover { background:rgba(59,130,246,0.1); color:var(--accent-primary); }
+
+    /* ===== Task Card Grid & Filters ===== */
+    #ops { display: grid; grid-template-columns: 1fr; gap: 10px; padding: 10px; }
+    .task-filter-bar { display: flex; gap: 6px; padding: 10px 10px 0; flex-wrap: wrap; }
+    .task-filter-btn { font-size: 11px; padding: 4px 10px; background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-muted); cursor: pointer; transition: all 0.15s; }
+    .task-filter-btn:hover { background: rgba(59,130,246,0.1); color: var(--text-main); }
+    .task-filter-btn.active { background: rgba(59,130,246,0.2); color: var(--accent-primary); border-color: var(--accent-primary); }
+    .task-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px; }
+    .task-card-id { font-family: monospace; font-size: 10px; opacity: 0.7; color: var(--text-muted); }
+    .task-card-actions { display: flex; gap: 6px; align-items: center; }
+    .status-badge { font-size: 10px; font-weight: 600; padding: 2px 6px; border-radius: 4px; }
+    .task-card-name { font-weight: 500; font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; color: var(--text-main); }
+    .task-card-target { font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 8px; }
+    .task-progress { height: 4px; background: rgba(255,255,255,0.1); border-radius: 2px; overflow: hidden; margin-bottom: 8px; }
+    .task-progress-bar { height: 100%; border-radius: 2px; transition: width 0.3s; }
+    .task-progress-bar.indeterminate { width: 40%; animation: indeterminate-progress 1s infinite linear; }
+    @keyframes indeterminate-progress { 0% { transform: translateX(-100%); } 100% { transform: translateX(250%); } }
+    .task-card-footer { display: flex; justify-content: flex-end; }
+    .task-card-time { font-size: 10px; color: var(--text-muted); }
+
+    /* ===== Mobile Timeline ===== */
+    #mobile-timeline { display: none; position: absolute; top: 0; left: 0; right: 0; bottom: 0; overflow-y: auto; padding: 12px; background: var(--bg-app); }
+    .mobile-timeline-list { display: flex; flex-direction: column; gap: 8px; }
+    .mobile-timeline-item { display: flex; align-items: center; gap: 12px; padding: 12px; background: var(--bg-panel); border: 1px solid var(--border-color); border-radius: 8px; cursor: pointer; min-height: 44px; }
+    .mobile-timeline-icon { font-size: 16px; font-weight: bold; width: 24px; text-align: center; flex-shrink: 0; }
+    .mobile-timeline-content { flex: 1; min-width: 0; }
+    .mobile-timeline-title { font-size: 13px; font-weight: 500; color: var(--text-main); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 4px; }
+    .mobile-timeline-meta { display: flex; gap: 8px; align-items: center; font-size: 11px; color: var(--text-muted); flex-wrap: wrap; }
+    .mobile-timeline-tool { background: rgba(59,130,246,0.1); color: var(--accent-primary); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+    .mobile-timeline-findings { background: rgba(16,185,129,0.1); color: var(--success); padding: 2px 6px; border-radius: 4px; font-size: 10px; }
+    .mobile-log-handle { display: none; }
+
+    /* ===== Mobile Media Query ===== */
+    @media (max-width: 767px) {
+      #topbar { height: 48px; padding: 0 12px; gap: 8px; }
+      .brand span { display: none; }
+      #layout { flex-direction: column-reverse; }
+      #sidebar { width: 100%; height: 56px; min-height: 56px; border-right: none; border-top: 1px solid var(--border-color); flex-direction: row; overflow-x: auto; overflow-y: hidden; -webkit-overflow-scrolling: touch; }
+      #sidebar .panel-header { display: none; }
+      #ops { display: flex; flex-direction: row; gap: 8px; padding: 8px; overflow-x: auto; overflow-y: hidden; flex: 1; }
+      #ops .task-card { min-width: 160px; max-width: 200px; margin-bottom: 0; flex-shrink: 0; }
+      #task-filter-bar { display: none; }
+      #right-panel { position: fixed; bottom: 56px; left: 0; right: 0; width: 100%; height: 40vh; border-left: none; border-top: 1px solid var(--border-color); z-index: 60; transform: translateY(calc(100% - 48px)); transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1); }
+      #right-panel.expanded { transform: translateY(0); }
+      #right-panel.collapsed { transform: translateY(calc(100% - 48px)); width: 100%; min-width: auto; border-left: none; }
+      .mobile-log-handle { height: 24px; display: flex; align-items: center; justify-content: center; background: var(--bg-panel); border-bottom: 1px solid var(--border-color); cursor: pointer; touch-action: none; }
+      .mobile-log-handle::after { content: ''; width: 36px; height: 4px; background: var(--border-highlight); border-radius: 2px; }
+      #main { height: calc(100vh - 48px - 56px); }
+      #controls, #legend { display: none !important; }
+      .floating-details { width: calc(100% - 24px); left: 12px !important; right: 12px !important; max-height: 60%; }
+      .ev-body { flex-direction: column; }
+      .ev-filter { flex: none; width: 100%; border-right: none; border-bottom: 1px solid var(--border-color); }
+      .ev-list { flex: none; width: 100%; border-right: none; max-height: 200px; }
+      .ev-detail { flex: 1; }
+      .btn, .task-card, .mobile-timeline-item, .tab-btn, .chat-q-btn, .chat-send-btn { min-height: 44px; }
+      .sidebar-toggle-btn { display: none; }
+    }
+  </style>
   <script src="/static/i18n.js?v=20241224"></script>
 </head>
 
@@ -42,6 +181,7 @@
       </div>
       <div style="width:1px;height:24px;background:var(--border-color);margin:0 10px;"></div>
       <div class="flex gap-2">
+        <button class="btn" data-i18n="btn.evidence" onclick="openEvidenceView()">证据</button>
         <button class="btn" data-i18n="btn.mcp" onclick="openMCPModal()">MCP</button>
         <button class="btn" data-i18n="btn.inject" onclick="openInjectModal()">Inject</button>
         <button class="btn" data-i18n="btn.refresh" onclick="render(true)">刷新</button>
@@ -59,6 +199,7 @@
         <div class="panel-header" data-i18n="sidebar.operations">操作列表</div>
         <ul id="ops"></ul>
       </aside>
+      <div id="sidebar-resizer"></div>
 
       <main id="main">
         <!-- 左侧折叠按钮 -->
@@ -88,6 +229,7 @@
         </div>
 
         <svg id="d3-graph" width="100%" height="100%"></svg>
+        <div id="mobile-timeline"></div>
         <div id="controls" class="floating-panel">
           <button class="btn" onclick="zoomIn()">+</button>
           <button class="btn" onclick="zoomOut()">-</button>
@@ -119,9 +261,18 @@
       </main>
 
       <aside id="right-panel">
+        <div class="mobile-log-handle"></div>
         <div id="llm-output-container">
-          <div class="panel-header">
+          <div class="panel-header" style="flex-wrap:wrap;gap:6px;">
             <span>Agent Logs (Output Only)</span>
+            <input id="log-search" placeholder="搜索日志..." style="flex:1;min-width:80px;padding:3px 8px;font-size:12px;background:var(--bg-input);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;outline:none;">
+            <select id="log-type-filter" multiple style="width:100px;padding:2px;font-size:11px;background:var(--bg-input);color:var(--text-main);border:1px solid var(--border-color);border-radius:4px;outline:none;">
+              <option value="executor" selected>executor</option>
+              <option value="planner" selected>planner</option>
+              <option value="reflector" selected>reflector</option>
+              <option value="system" selected>system</option>
+            </select>
+            <button id="btn-download-report" class="btn" style="display:none;font-size:11px;padding:3px 10px;" onclick="downloadReport()">下载报告</button>
             <span id="typing-indicator" style="display:none;color:var(--success)">● Live</span>
           </div>
           <div id="llm-stream" class="panel-content"></div>
@@ -303,6 +454,91 @@
             </div>
           </div>
         </div>
+
+        <!-- Scope 边界配置（折叠） -->
+        <div class="advanced-config" style="margin-top:12px;">
+          <div class="advanced-header" onclick="toggleScopeConfig()">
+            <span>Scope 边界配置</span>
+            <svg id="scope-arrow" width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+              style="transition:transform 0.2s;">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+            </svg>
+          </div>
+          <div id="scope-content" style="display:none;margin-top:12px;">
+            <div style="display:flex;justify-content:flex-end;margin-bottom:8px;">
+              <button class="btn" style="font-size:12px;padding:4px 12px;" onclick="loadScopeDefaults()">加载默认值</button>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;">
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">允许目标 (逗号分隔)</label>
+                <input id="scope-allowed-targets"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="*, example.com">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">阻止目标 (逗号分隔)</label>
+                <input id="scope-blocked-targets"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="10.0.0.0/8, 192.168.0.0/16">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">允许端口 (逗号分隔)</label>
+                <input id="scope-allowed-ports"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="80, 443, 8080">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">禁用工具 (逗号分隔)</label>
+                <input id="scope-disabled-tools"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="shell_exec, python_exec">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">最大响应大小 (字节)</label>
+                <input id="scope-max-response-size" type="number"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="50000">
+              </div>
+              <div>
+                <label class="block text-xs text-gray-500 mb-1">速率限制 (请求/秒)</label>
+                <input id="scope-rate-limit" type="number" step="0.1"
+                  class="w-full bg-slate-700 border border-slate-600 rounded p-2 text-white text-sm"
+                  placeholder="10.0">
+              </div>
+            </div>
+            <div style="display:flex;gap:24px;margin-top:12px;flex-wrap:wrap;">
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" id="scope-disable-shell" class="rounded">
+                <span>禁用 shell_exec</span>
+              </label>
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" id="scope-disable-python" class="rounded">
+                <span>禁用 python_exec</span>
+              </label>
+              <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                <input type="checkbox" id="scope-block-private" class="rounded">
+                <span>阻止私有网络</span>
+              </label>
+            </div>
+            <div style="margin-top:12px;">
+              <label class="block text-xs text-gray-500 mb-2">禁止扫描类型</label>
+              <div class="flex gap-4 flex-wrap">
+                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                  <input type="checkbox" id="scope-block-udp-full" class="rounded" value="udp_full">
+                  <span>UDP 全端口</span>
+                </label>
+                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                  <input type="checkbox" id="scope-block-tcp-full" class="rounded" value="tcp_full">
+                  <span>TCP 全端口</span>
+                </label>
+                <label class="flex items-center gap-2 text-xs text-gray-400 cursor-pointer">
+                  <input type="checkbox" id="scope-block-udp-syn" class="rounded" value="udp_syn">
+                  <span>UDP SYN</span>
+                </label>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
       <div class="modal-footer"
         style="padding:16px 24px;background:var(--bg-sidebar);border-top:1px solid var(--border-color);">
@@ -324,7 +560,7 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=20260307v1"></script>
+  <script src="/static/app.js?v=20260524v1"></script>
 </body>
 
 </html>

@@ -315,11 +315,24 @@ The system now runs as two separate processes: the **Web Server** (dashboard) an
 
 Start the persistent web interface first. This process should remain running.
 
+**Recommended (uvicorn directly):**
+
 ```bash
-python -m web.server
+python -m uvicorn web.server:app --host 127.0.0.1 --port 8088
 ```
 
 > Open your browser and visit: **<http://localhost:8088>**
+
+**Why not `python -m web.server` in Git Bash background?**
+
+In Git Bash (MSYS2) on Windows, running `python -m web.server &` to background the process often causes it to exit immediately. This happens because MSYS2 emulates POSIX job control poorly for Python processes that spawn child threads (like uvicorn's ASGI server). The stdin/stdout handles are closed or detached in a way that triggers `EOFError` or `OSError` inside the Python runtime.
+
+**Workarounds:**
+
+- **Use uvicorn directly** (recommended): `python -m uvicorn web.server:app --host 127.0.0.1 --port 8088`
+- **Windows background (no console window)**: `pythonw -m uvicorn web.server:app --host 127.0.0.1 --port 8088`
+- **PowerShell supervision script**: See the supervision script below.
+- **Linux systemd**: See the systemd service template below.
 
 #### 2. Run an Agent Task
 
@@ -336,6 +349,38 @@ python agent.py \
     --goal "Scan localhost" \
     --task-name "local_scan" \
     --web
+```
+
+#### 3. Process Supervision (Production / Long-Running)
+
+For production or long-running tasks, use a process supervisor to restart the agent on crash.
+
+**Windows — PowerShell supervision script:**
+
+```powershell
+# Run from project root
+.\scripts\supervise-agent.ps1 `
+    -Goal "Test http://example.com" `
+    -TaskName "example_pentest" `
+    -ExtraArgs "--output-mode simple"
+```
+
+The script restarts `python agent.py` up to 5 times on failure and logs each attempt to `logs/supervise-agent.log`.
+
+**Linux — systemd service:**
+
+```bash
+# 1. Copy service template
+sudo cp scripts/luan1ao-agent.service /etc/systemd/system/
+
+# 2. Reload systemd
+sudo systemctl daemon-reload
+
+# 3. Start service (pass goal as instance parameter)
+sudo systemctl start luan1ao-agent@"Test http://example.com".service
+
+# 4. View logs
+sudo journalctl -u luan1ao-agent@"Test http://example.com".service -f
 ```
 
 ### Viewing Results

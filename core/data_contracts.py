@@ -174,6 +174,114 @@ class ExploitNode(BaseCausalNode):
 CausalNode = Union[EvidenceNode, HypothesisNode, VulnerabilityNode, ExploitNode, "AttackGoalNode"]
 
 
+# ==================================================
+# 结构化观测数据契约（输出表征优化 P1）
+# ==================================================
+
+
+@dataclass
+class ToolFinding:
+    """工具执行结果中提取的结构化发现项."""
+
+    category: str  # "open_port" / "service" / "subdomain" / "tech_stack" / "vuln" / "http_header" / "url" / "os"
+    key: str  # 唯一标识，如 "80/tcp"
+    value: str | dict  # 核心值
+    confidence: float  # 0.0-1.0
+    evidence_ref: str | None = None  # 原始输出行引用
+
+    def to_dict(self) -> dict:
+        return {
+            "category": self.category,
+            "key": self.key,
+            "value": self.value,
+            "confidence": self.confidence,
+            "evidence_ref": self.evidence_ref,
+        }
+
+
+@dataclass
+class ToolError:
+    """工具执行错误信息（7类分类）. """
+
+    error_type: str  # MISSING_TOOL / TIMEOUT / AUTH / SYNTAX / NETWORK / RUNTIME / UNKNOWN
+    message: str
+    fix_suggestion: str
+    is_correctable: bool
+
+    CORRECTABLE_TYPES = {"SYNTAX", "TIMEOUT", "NETWORK"}
+    PARTIALLY_CORRECTABLE = {"MISSING_TOOL"}
+
+    def to_dict(self) -> dict:
+        return {
+            "error_type": self.error_type,
+            "message": self.message,
+            "fix_suggestion": self.fix_suggestion,
+            "is_correctable": self.is_correctable,
+        }
+
+    @classmethod
+    def from_json_response(cls, data: dict) -> Optional["ToolError"]:
+        """从 MCP 工具 JSON 响应解析错误."""
+        if data.get("success") is not False:
+            return None
+        error_type = data.get("error_type", "UNKNOWN")
+        message = data.get("message", str(data))
+        fix_suggestion = data.get("fix_suggestion", "")
+        is_correctable = error_type in cls.CORRECTABLE_TYPES or (
+            error_type in cls.PARTIALLY_CORRECTABLE
+        )
+        return cls(
+            error_type=error_type,
+            message=message,
+            fix_suggestion=fix_suggestion,
+            is_correctable=is_correctable,
+        )
+
+
+@dataclass
+class StructuredObservation:
+    """结构化观测结果，替代扁平字符串传递给 LLM."""
+
+    step_id: str
+    tool: str
+    status: Literal["success", "partial", "failed"]
+    summary: str  # LLM 友好摘要（2-3 行）
+    raw_output: str  # 完整原始输出（按需截断）
+    findings: list[ToolFinding]
+    errors: list[ToolError]
+    evidence_ids: list[str]
+    truncated: bool = False
+    truncation_info: str | None = None
+
+    def to_dict(self) -> dict:
+        return {
+            "step_id": self.step_id,
+            "tool": self.tool,
+            "status": self.status,
+            "summary": self.summary,
+            "raw_output": self.raw_output,
+            "findings": [f.to_dict() for f in self.findings],
+            "errors": [e.to_dict() for e in self.errors],
+            "evidence_ids": self.evidence_ids,
+            "truncated": self.truncated,
+            "truncation_info": self.truncation_info,
+        }
+
+    def format_for_llm(self) -> str:
+        """生成 LLM 友好摘要（替代旧的全量字符串拼接）. """
+        status_icon = {"success": "✅", "partial": "⚠️", "failed": "❌"}.get(self.status, "❓")
+        parts = [f"{status_icon} [{self.tool}] {self.step_id}: {self.summary}"]
+        if self.findings:
+            cats = ", ".join(sorted(set(f.category for f in self.findings)))
+            parts.append(f"  → 发现: {len(self.findings)} 项 ({cats})")
+        if self.errors:
+            for err in self.errors:
+                parts.append(f"  → 错误: [{err.error_type}] {err.message}")
+        if self.truncated and self.truncation_info:
+            parts.append(f"  → ⚠️ 输出截断: {self.truncation_info}")
+        return "\n".join(parts)
+
+
 @dataclass
 class AttackGoalNode(BaseCausalNode):
     """

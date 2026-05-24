@@ -32,8 +32,111 @@ const causalColors = {
 const PHASE_BANNER_DEFAULT_BG = 'rgba(59, 130, 246, 0.95)';
 const PHASE_BANNER_SUCCESS_BG = 'linear-gradient(90deg, rgba(16, 185, 129, 0.9), rgba(5, 150, 105, 0.9))';
 const PHASE_BANNER_ABORTED_BG = 'rgba(239, 68, 68, 0.95)';
-let state = { op_id: new URLSearchParams(location.search).get('op_id') || '', view: 'exec', simulation: null, svg: null, g: null, zoom: null, es: null, processedEvents: new Set(), pendingReq: null, isModifyMode: false, currentPhase: null, missionAccomplished: false, isAborted: false, taskStatus: null, userHasInteracted: false, lastActiveNodeId: null, isProgrammaticZoom: false, renderDebounceTimer: null, lastRenderTime: 0, isLoadingHistory: false, collapsedNodes: new Set(), userExpandedNodes: new Set(), leftSidebarCollapsed: false, rightSidebarCollapsed: false };
+let state = { op_id: new URLSearchParams(location.search).get('op_id') || '', view: 'exec', simulation: null, svg: null, g: null, zoom: null, es: null, processedEvents: new Set(), pendingReq: null, isModifyMode: false, currentPhase: null, missionAccomplished: false, isAborted: false, taskStatus: null, userHasInteracted: false, lastActiveNodeId: null, isProgrammaticZoom: false, renderDebounceTimer: null, lastRenderTime: 0, isLoadingHistory: false, collapsedNodes: new Set(), userExpandedNodes: new Set(), leftSidebarCollapsed: false, rightSidebarCollapsed: false, taskFilter: 'all', isMobile: false, _lastGraphData: null };
 const api = (p, b) => fetch(p + (p.includes('?') ? '&' : '?') + `op_id=${state.op_id}`, b ? { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) } : {}).then(r => r.json());
+
+// Log filtering state
+const logFilters = { search: "", types: new Set(["executor", "planner", "reflector", "system"]) };
+let logSearchDebounceTimer = null;
+let opsRefreshDebounce = null;
+
+function getLogCategory(msg, roleName) {
+  if (roleName && roleName !== 'SYSTEM') {
+    return roleName.toLowerCase();
+  }
+  const eventType = msg.event || '';
+  if (eventType.includes('executor')) return 'executor';
+  if (eventType.includes('planner')) return 'planner';
+  if (eventType.includes('reflector')) return 'reflector';
+  return 'system';
+}
+
+function matchesLogFilter(msg, roleName) {
+  const category = getLogCategory(msg, roleName);
+  if (!logFilters.types.has(category)) return false;
+  if (logFilters.search) {
+    const text = JSON.stringify(msg).toLowerCase();
+    if (!text.includes(logFilters.search.toLowerCase())) return false;
+  }
+  return true;
+}
+
+function applyLogFilters() {
+  const container = document.getElementById('llm-stream');
+  if (!container) return;
+  const entries = container.querySelectorAll('.llm-msg');
+  const searchLower = logFilters.search.toLowerCase();
+  entries.forEach(el => {
+    const category = el.dataset.category || 'system';
+    const searchText = (el.dataset.searchText || '').toLowerCase();
+    let visible = logFilters.types.has(category);
+    if (visible && searchLower) {
+      visible = searchText.includes(searchLower);
+    }
+    el.style.display = visible ? '' : 'none';
+  });
+}
+
+function initLogFilters() {
+  const searchInput = document.getElementById('log-search');
+  const typeFilter = document.getElementById('log-type-filter');
+  if (searchInput) {
+    searchInput.addEventListener('input', (e) => {
+      if (logSearchDebounceTimer) clearTimeout(logSearchDebounceTimer);
+      logSearchDebounceTimer = setTimeout(() => {
+        logFilters.search = e.target.value;
+        applyLogFilters();
+      }, 300);
+    });
+  }
+  if (typeFilter) {
+    typeFilter.addEventListener('change', () => {
+      const selected = new Set(Array.from(typeFilter.selectedOptions).map(o => o.value));
+      logFilters.types = selected.size > 0 ? selected : new Set(['system']);
+      applyLogFilters();
+    });
+  }
+}
+
+async function downloadReport() {
+  if (!state.op_id) return;
+  const isZh = (window.currentLang || 'zh') === 'zh';
+  try {
+    const resp = await fetch(`/api/report/${state.op_id}/download`);
+    if (resp.status === 404) {
+      alert(isZh ? '报告文件未找到' : 'Report file not found');
+      return;
+    }
+    if (!resp.ok) {
+      alert(isZh ? '下载报告失败' : 'Failed to download report');
+      return;
+    }
+    const blob = await resp.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const disposition = resp.headers.get('Content-Disposition');
+    let filename = 'report.md';
+    if (disposition) {
+      const match = disposition.match(/filename="?([^"]+)"?/);
+      if (match) filename = match[1];
+    }
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  } catch (e) {
+    alert((isZh ? '下载报告失败: ' : 'Failed to download report: ') + e.message);
+  }
+}
+
+function updateDownloadButtonVisibility() {
+  const btn = document.getElementById('btn-download-report');
+  if (!btn) return;
+  const taskDone = state.taskStatus && (state.taskStatus.achieved || state.taskStatus.failed || state.taskStatus.aborted);
+  btn.style.display = taskDone ? 'inline-flex' : 'none';
+}
 
 // 显示阶段横幅
 function showPhaseBanner(phase) {
@@ -71,6 +174,7 @@ function hidePhaseBanner() {
 // 显示任务成功横幅
 function showSuccessBanner() {
   const banner = document.getElementById('phase-banner');
+  if (!banner) return;
   const spinner = banner.querySelector('.spinner');
   const text = document.getElementById('phase-text');
 
@@ -84,6 +188,7 @@ function showSuccessBanner() {
 // 显示任务已终止横幅
 function showAbortedBanner() {
   const banner = document.getElementById('phase-banner');
+  if (!banner) return;
   const spinner = banner.querySelector('.spinner');
   const text = document.getElementById('phase-text');
 
@@ -97,15 +202,229 @@ function showAbortedBanner() {
 
 document.addEventListener('DOMContentLoaded', () => {
   initD3();
+  initLogFilters();
+  checkMobileView();
   loadOps().then(() => { if (!state.op_id) { const f = document.querySelector('.task-card'); if (f) selectOp(f.dataset.op); } else selectOp(state.op_id, false); });
   setInterval(checkPendingIntervention, 2000);
+  initMobileLogSheet();
+  initPanelDrag();
+  const hitlCheckbox = document.getElementById('create-hitl');
+  if (hitlCheckbox) {
+    hitlCheckbox.addEventListener('change', updateHitlLabel);
+  }
 });
+
+window.addEventListener('resize', () => {
+  checkMobileView();
+  if (state.op_id) render(true);
+});
+
+function checkMobileView() {
+  const wasMobile = state.isMobile;
+  state.isMobile = window.innerWidth < 768;
+  document.body.classList.toggle('mobile-view', state.isMobile);
+
+  const dagSvg = document.getElementById('d3-graph');
+  const timeline = document.getElementById('mobile-timeline');
+  const controls = document.getElementById('controls');
+  const legend = document.getElementById('legend');
+  const details = document.getElementById('node-details-panel');
+  const rightPanel = document.getElementById('right-panel');
+
+  if (state.isMobile) {
+    if (dagSvg) dagSvg.style.display = 'none';
+    if (timeline) timeline.style.display = 'block';
+    if (controls) controls.style.display = 'none';
+    if (legend) legend.style.display = 'none';
+    if (details) details.classList.remove('show');
+    if (rightPanel) {
+      rightPanel.classList.add('collapsed');
+      rightPanel.classList.remove('expanded');
+      state.rightSidebarCollapsed = true;
+    }
+  } else {
+    if (dagSvg) dagSvg.style.display = 'block';
+    if (timeline) timeline.style.display = 'none';
+    if (controls) controls.style.display = 'flex';
+    if (legend) legend.style.display = 'block';
+    if (rightPanel) {
+      rightPanel.classList.remove('collapsed');
+      rightPanel.classList.remove('expanded');
+      state.rightSidebarCollapsed = false;
+    }
+  }
+}
+
+function renderMobileTimeline(data) {
+  const container = document.getElementById('mobile-timeline');
+  if (!container) return;
+
+  if (!data || !data.nodes || data.nodes.length === 0) {
+    if (state.placeholderRootNode && state.placeholderRootNode.id === state.op_id) {
+      const p = state.placeholderRootNode;
+      const statusColor = nodeColors[p.status] || '#64748b';
+      container.innerHTML = `<div class="mobile-timeline-list">
+        <div class="mobile-timeline-item">
+          <div class="mobile-timeline-icon" style="color:${statusColor}">◉</div>
+          <div class="mobile-timeline-content">
+            <div class="mobile-timeline-title">${escapeHtml(p.label || p.id)}</div>
+            <div class="mobile-timeline-meta">
+              <span class="mobile-timeline-tool">${t('timeline.planning') || 'Planning...'}</span>
+            </div>
+          </div>
+        </div>
+      </div>`;
+      return;
+    }
+    container.innerHTML = '<div style="padding:40px;text-align:center;color:var(--text-muted)">' + (t('timeline.no_data') || 'No data') + '</div>';
+    return;
+  }
+
+  // For exec view, show action/task nodes; for causal, show all causal nodes
+  const isExec = state.view === 'exec';
+  const timelineNodes = data.nodes
+    .filter(n => isExec ? (n.type === 'action' || n.type === 'task') : true)
+    .sort((a, b) => {
+      const timeA = a.completed_at || a.created_at || 0;
+      const timeB = b.completed_at || b.created_at || 0;
+      return timeB - timeA;
+    });
+
+  let h = '<div class="mobile-timeline-list">';
+  timelineNodes.forEach(n => {
+    const statusColor = nodeColors[n.status] || nodeColors[n.node_type || n.type] || '#64748b';
+    const statusIcon = n.status === 'completed' ? '✓' :
+      n.status === 'failed' ? '✗' :
+        n.status === 'in_progress' || n.status === 'running' ? '◉' : '○';
+    const toolName = isExec
+      ? (n.tool_name || (n.type === 'task' ? t('type.task') : t('type.action')))
+      : (n.node_type || n.type || 'Node');
+    const findings = n.findings || (n.data && n.data.findings) || [];
+    const findingsCount = Array.isArray(findings) ? findings.length : Object.keys(findings).length;
+    const time = n.completed_at
+      ? new Date(n.completed_at * 1000).toLocaleTimeString()
+      : (n.created_at ? new Date(n.created_at * 1000).toLocaleTimeString() : '');
+
+    h += `
+      <div class="mobile-timeline-item" onclick="showDetailsFromTimeline('${escapeHtml(n.id)}')">
+        <div class="mobile-timeline-icon" style="color:${statusColor}">${statusIcon}</div>
+        <div class="mobile-timeline-content">
+          <div class="mobile-timeline-title">${escapeHtml(n.label || n.id)}</div>
+          <div class="mobile-timeline-meta">
+            <span class="mobile-timeline-tool">${escapeHtml(toolName)}</span>
+            ${findingsCount > 0 ? `<span class="mobile-timeline-findings">${findingsCount} ${t('timeline.findings')}</span>` : ''}
+            <span class="mobile-timeline-time">${time}</span>
+          </div>
+        </div>
+      </div>
+    `;
+  });
+  h += '</div>';
+  container.innerHTML = h;
+}
+
+function showDetailsFromTimeline(nodeId) {
+  if (!state._lastGraphData) return;
+  const node = state._lastGraphData.nodes.find(n => n.id === nodeId);
+  if (node) showDetails(node);
+}
+
+function initMobileLogSheet() {
+  const sheet = document.getElementById('right-panel');
+  const handle = document.querySelector('.mobile-log-handle');
+  if (!sheet || !handle) return;
+
+  let startY = 0;
+  let isDragging = false;
+
+  handle.addEventListener('touchstart', e => {
+    startY = e.touches[0].clientY;
+    isDragging = true;
+  }, { passive: true });
+
+  handle.addEventListener('touchmove', e => {
+    if (!isDragging) return;
+    const deltaY = e.touches[0].clientY - startY;
+    if (sheet.classList.contains('expanded')) {
+      if (deltaY > 50) {
+        sheet.classList.remove('expanded');
+        sheet.classList.add('collapsed');
+        isDragging = false;
+      }
+    } else {
+      if (deltaY < -50) {
+        sheet.classList.add('expanded');
+        sheet.classList.remove('collapsed');
+        isDragging = false;
+      }
+    }
+  }, { passive: true });
+
+  handle.addEventListener('touchend', () => {
+    isDragging = false;
+  });
+
+  handle.addEventListener('click', () => {
+    if (sheet.classList.contains('expanded')) {
+      sheet.classList.remove('expanded');
+      sheet.classList.add('collapsed');
+    } else {
+      sheet.classList.add('expanded');
+      sheet.classList.remove('collapsed');
+    }
+  });
+}
 
 async function loadOps() {
   try {
     const data = await fetch('/api/ops').then(r => r.json());
-    const list = document.getElementById('ops'); list.innerHTML = '';
-    data.items.forEach(i => {
+    const list = document.getElementById('ops');
+
+    // Create or update filter bar
+    let filterBar = document.getElementById('task-filter-bar');
+    if (!filterBar) {
+      filterBar = document.createElement('div');
+      filterBar.id = 'task-filter-bar';
+      filterBar.className = 'task-filter-bar';
+      list.parentNode.insertBefore(filterBar, list);
+
+      const filters = [
+        { key: 'all', label: t('filter.all') || '全部' },
+        { key: 'running', label: t('filter.running') || '运行中' },
+        { key: 'completed', label: t('filter.completed') || '已完成' },
+        { key: 'crashed', label: t('filter.crashed') || '崩溃' }
+      ];
+
+      filters.forEach(f => {
+        const btn = document.createElement('button');
+        btn.className = 'task-filter-btn' + (f.key === state.taskFilter ? ' active' : '');
+        btn.textContent = f.label;
+        btn.onclick = () => {
+          state.taskFilter = f.key;
+          loadOps();
+        };
+        filterBar.appendChild(btn);
+      });
+    } else {
+      filterBar.querySelectorAll('.task-filter-btn').forEach((btn, idx) => {
+        const keys = ['all', 'running', 'completed', 'crashed'];
+        btn.classList.toggle('active', keys[idx] === state.taskFilter);
+      });
+    }
+
+    list.innerHTML = '';
+
+    // Filter items
+    let items = data.items;
+    if (state.taskFilter === 'running') {
+      items = items.filter(i => !i.status.achieved && !i.status.failed && !i.status.aborted);
+    } else if (state.taskFilter === 'completed') {
+      items = items.filter(i => i.status.achieved);
+    } else if (state.taskFilter === 'crashed') {
+      items = items.filter(i => i.status.failed || i.status.aborted);
+    }
+
+    items.forEach(i => {
       const li = document.createElement('li');
       li.className = `task-card ${i.op_id === state.op_id ? 'active' : ''}`;
       li.dataset.op = i.op_id;
@@ -114,35 +433,63 @@ async function loadOps() {
       li.dataset.statusFailed = i.status.failed ? 'true' : 'false';
       li.onclick = () => selectOp(i.op_id, false);
 
-      let color = 'var(--accent-primary)'; // Default: in progress / pending
-      if (i.status.achieved) color = 'var(--success)';
-      else if (i.status.failed) color = 'var(--error)';
-      else if (i.status.aborted) color = '#94a3b8'; // Grey for aborted
+      let statusColor, statusLabel, progressPercent, progressClass;
+      if (i.status.achieved) {
+        statusColor = 'var(--success)';
+        statusLabel = t('status.completed') || '已完成';
+        progressPercent = 100;
+        progressClass = '';
+      } else if (i.status.failed) {
+        statusColor = 'var(--error)';
+        statusLabel = t('status.failed') || '失败';
+        progressPercent = 100;
+        progressClass = '';
+      } else if (i.status.aborted) {
+        statusColor = '#94a3b8';
+        statusLabel = t('status.aborted') || 'Aborted';
+        progressPercent = 100;
+        progressClass = '';
+      } else {
+        statusColor = 'var(--accent-primary)';
+        statusLabel = t('status.running') || '运行中';
+        progressPercent = 0;
+        progressClass = 'indeterminate';
+      }
 
-      // 显示名称：优先使用task_id（name字段），否则使用goal的前30字符
       const displayName = i.task_id || (i.goal ? i.goal.slice(0, 30) + (i.goal.length > 30 ? '...' : '') : 'Unnamed');
+      const targetText = i.goal ? escapeHtml(i.goal.slice(0, 50) + (i.goal.length > 50 ? '...' : '')) : '';
+      const timeText = i.updated_at
+        ? new Date(i.updated_at * 1000).toLocaleString()
+        : (i.created_at ? new Date(i.created_at * 1000).toLocaleString() : '');
 
       if (i.op_id === state.op_id) {
         state.taskStatus = i.status;
-        // 如果当前选中任务已是终态，确保移除所有过程横幅
         if (i.status.aborted || i.status.achieved || i.status.failed) {
           hidePhaseBanner();
         }
+        updateDownloadButtonVisibility();
       }
 
-      li.innerHTML = `<div class="flex justify-between mb-1">
-          <span style="font-family:monospace;font-size:10px;opacity:0.7">#${i.op_id.slice(-4)}</span>
-          <div style="display:flex;gap:8px;align-items:center;">
-              <span class="status-dot" style="background:${color}" title="${i.status.raw}"></span>
+      const progressBar = `<div class="task-progress"><div class="task-progress-bar ${progressClass}" style="${progressPercent > 0 ? 'width:' + progressPercent + '%;' : ''}background:${statusColor}"></div></div>`;
+
+      li.innerHTML = `<div class="task-card-header">
+          <span class="task-card-id">#${i.op_id.slice(-4)}</span>
+          <div class="task-card-actions">
+              <span class="status-badge" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${statusLabel}</span>
               <span class="rename-btn" onclick="renameOp(event, '${i.op_id}', this)" title="Rename">✏️</span>
               <span class="delete-btn" onclick="deleteOp(event, '${i.op_id}')" title="Delete Task">✕</span>
           </div>
       </div>
-      <div class="task-name" data-op="${i.op_id}" style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${escapeHtml(i.goal)}">${escapeHtml(displayName)}</div>`;
+      <div class="task-card-name" data-op="${i.op_id}" title="${escapeHtml(i.goal)}">${escapeHtml(displayName)}</div>
+      <div class="task-card-target" title="${escapeHtml(i.goal)}">${targetText}</div>
+      ${progressBar}
+      <div class="task-card-footer">
+          <span class="task-card-time">${timeText}</span>
+      </div>`;
       list.appendChild(li);
     });
     initOpsDragAndDrop();
-  } catch (e) { }
+  } catch (e) { console.error('loadOps error', e); }
 }
 
 function initOpsDragAndDrop() {
@@ -250,7 +597,7 @@ async function renameOp(e, opId, btn) {
   e.stopPropagation();
 
   const taskCard = btn.closest('.task-card');
-  const nameEl = taskCard.querySelector('.task-name');
+  const nameEl = taskCard.querySelector('.task-card-name');
   if (!nameEl) return;
 
   const currentName = nameEl.textContent;
@@ -306,7 +653,12 @@ async function renameOp(e, opId, btn) {
 }
 
 function selectOp(id, refresh = true) {
-  if (!id) return; state.op_id = id;
+  if (!id) return;
+  if (opsRefreshDebounce) {
+    clearTimeout(opsRefreshDebounce);
+    opsRefreshDebounce = null;
+  }
+  state.op_id = id;
   document.querySelectorAll('.task-card').forEach(el => el.classList.toggle('active', el.dataset.op === id));
   history.replaceState(null, '', `?op_id=${id}`);
   document.getElementById('llm-stream').innerHTML = '';
@@ -345,6 +697,8 @@ function selectOp(id, refresh = true) {
     hidePhaseBanner(); // 隐藏阶段横幅，等待正确状态加载
   }
 
+  updateDownloadButtonVisibility();
+
   document.getElementById('node-detail-content').innerHTML = '<div style="padding:20px;text-align:center;color:#64748b">Loading...</div>';
   closeDetails();
   if (state.es) state.es.close(); subscribe(); render(true); if (refresh) loadOps();
@@ -356,6 +710,12 @@ async function render(force) {
   // 记录当前渲染的任务ID，用于检测竞争条件
   const renderingOpId = state.op_id;
 
+  // 清除已有的防抖定时器
+  if (state.renderDebounceTimer) {
+    clearTimeout(state.renderDebounceTimer);
+    state.renderDebounceTimer = null;
+  }
+
   // 防抖：如果上次渲染时间距现在不足 300ms 且非强制刷新，则跳过
   const now = Date.now();
   if (!force && state.missionAccomplished && (now - state.lastRenderTime) < 500) {
@@ -363,10 +723,13 @@ async function render(force) {
     return;
   }
 
-  // 清除已有的防抖定时器
-  if (state.renderDebounceTimer) {
-    clearTimeout(state.renderDebounceTimer);
-    state.renderDebounceTimer = null;
+  // 通用防抖：非强制刷新时延迟 200ms 执行
+  if (!force) {
+    state.renderDebounceTimer = setTimeout(() => {
+      state.renderDebounceTimer = null;
+      render(true);
+    }, 200);
+    return;
   }
 
   state.lastRenderTime = now;
@@ -382,7 +745,13 @@ async function render(force) {
       return;
     }
 
-    drawForceGraph(data);
+    state._lastGraphData = data;
+
+    if (state.isMobile) {
+      renderMobileTimeline(data);
+    } else {
+      drawForceGraph(data);
+    }
     updateLegend();
 
     // 检测规划完成：如果有子任务且当前处于 planning 阶段，切换为 executing
@@ -776,6 +1145,14 @@ function drawForceGraph(data) {
     .y(d => d.y)
     .curve(d3.curveBasis); // 使用 Basis 样条插值实现平滑曲线
 
+  // Build node type and confidence maps for causal edge animation
+  const nodeTypeMap = new Map();
+  const nodeConfidenceMap = new Map();
+  data.nodes.forEach(n => {
+    nodeTypeMap.set(n.id, n.node_type || n.type);
+    nodeConfidenceMap.set(n.id, n.confidence !== undefined ? n.confidence : 0.5);
+  });
+
   const links = g.selectAll(".link")
     .data(dagreGraph.edges())
     .enter().append("path")
@@ -783,13 +1160,58 @@ function drawForceGraph(data) {
       const edgeData = dagreGraph.edge(d);
       // 如果目标节点正在运行，则连线也设为 active
       const targetNode = data.nodes.find(n => n.id === d.w);
-      return `link ${targetNode && targetNode.status === 'running' ? 'active' : ''}`;
+      let classes = `link ${targetNode && targetNode.status === 'running' ? 'active' : ''}`;
+
+      // Causal edge animation: Evidence -> Hypothesis -> Vulnerability
+      if (state.view === 'causal') {
+        const sourceType = nodeTypeMap.get(d.v);
+        const targetType = nodeTypeMap.get(d.w);
+        const isCausalEdge = (sourceType === 'Evidence' && targetType === 'Hypothesis') ||
+                             (sourceType === 'Hypothesis' && (targetType === 'Vulnerability' || targetType === 'ConfirmedVulnerability'));
+        if (isCausalEdge) {
+          classes += ' causal-link';
+        }
+      }
+      return classes;
     })
     .attr("d", d => {
       const points = dagreGraph.edge(d).points;
       return lineGen(points);
     })
-    .attr("marker-end", "url(#arrow)");
+    .attr("marker-end", "url(#arrow)")
+    .style("stroke-width", d => {
+      if (state.view === 'causal') {
+        const sourceType = nodeTypeMap.get(d.v);
+        const targetType = nodeTypeMap.get(d.w);
+        const isCausalEdge = (sourceType === 'Evidence' && targetType === 'Hypothesis') ||
+                             (sourceType === 'Hypothesis' && (targetType === 'Vulnerability' || targetType === 'ConfirmedVulnerability'));
+        if (isCausalEdge) {
+          const confidence = (sourceType === 'Evidence' && targetType === 'Hypothesis')
+            ? (nodeConfidenceMap.get(d.w) || 0.5)
+            : (nodeConfidenceMap.get(d.v) || 0.5);
+          // Higher confidence = thicker line (1.5px to 4px)
+          return 1.5 + confidence * 2.5;
+        }
+      }
+      return 2;
+    })
+    .style("animation-duration", d => {
+      if (state.view === 'causal') {
+        const sourceType = nodeTypeMap.get(d.v);
+        const targetType = nodeTypeMap.get(d.w);
+        const isCausalEdge = (sourceType === 'Evidence' && targetType === 'Hypothesis') ||
+                             (sourceType === 'Hypothesis' && (targetType === 'Vulnerability' || targetType === 'ConfirmedVulnerability'));
+        if (isCausalEdge) {
+          const confidence = (sourceType === 'Evidence' && targetType === 'Hypothesis')
+            ? (nodeConfidenceMap.get(d.w) || 0.5)
+            : (nodeConfidenceMap.get(d.v) || 0.5);
+          // Higher confidence = faster flow (0.5s to 2s)
+          const duration = Math.max(0.5, 2.0 - confidence * 1.5);
+          return duration + 's';
+        }
+      }
+      return null;
+    });
 
   // 4. 绘制节点 (圆角矩形)
   const nodes = g.selectAll(".node")
@@ -803,7 +1225,8 @@ function drawForceGraph(data) {
       const node = dagreGraph.node(d);
       return `translate(${node.x},${node.y})`;
     })
-    .on("click", (e, d) => showDetails(dagreGraph.node(d)));
+    .on("click", (e, d) => showDetails(dagreGraph.node(d)))
+    .on("contextmenu", (e, d) => showNodeContextMenu(d, e));
 
   // 节点背景 - 使用动态宽度和高度
   nodes.append("rect")
@@ -910,20 +1333,20 @@ function drawForceGraph(data) {
         const nodeType = n.node_type || n.type;
         // 节点类型翻译映射
         const typeLabels = {
-          'KeyFact': currentLang === 'zh' ? '关键事实' : 'Key Fact',
-          'Evidence': currentLang === 'zh' ? '证据' : 'Evidence',
-          'Hypothesis': currentLang === 'zh' ? '假设' : 'Hypothesis',
-          'Vulnerability': currentLang === 'zh' ? '漏洞' : 'Vuln',
-          'ConfirmedVulnerability': currentLang === 'zh' ? '确认漏洞' : 'Confirmed',
-          'Flag': 'Flag'
+          'KeyFact': t('causal.keyfact'),
+          'Evidence': t('causal.evidence'),
+          'Hypothesis': t('causal.hypothesis'),
+          'Vulnerability': t('causal.vulnerability'),
+          'ConfirmedVulnerability': t('causal.confirmed_vuln'),
+          'Flag': t('causal.flag')
         };
         return typeLabels[nodeType] || nodeType || 'UNKNOWN';
       }
 
       // 执行图：显示任务类型
-      if (n.type === 'root') return currentLang === 'zh' ? '主任务' : 'Root';
-      if (n.type === 'task') return currentLang === 'zh' ? '子任务' : 'Task';
-      if (n.type === 'action') return currentLang === 'zh' ? '动作' : 'Action';
+      if (n.type === 'root') return t('type.root');
+      if (n.type === 'task') return t('type.task');
+      if (n.type === 'action') return t('type.action');
       return 'NODE';
     });
 
@@ -984,6 +1407,11 @@ function drawForceGraph(data) {
       return n.status || "";
     });
 
+  // Initialize tippy once per node to avoid memory leaks
+  nodes.each(function (d) {
+    tippy(this, { content: `<b>${dagreGraph.node(d).type}</b><br>${dagreGraph.node(d).label || d}`, allowHTML: true });
+  });
+
   // 5. 交互：聚焦模式 (Focus Mode)
   nodes.on("mouseenter", function (event, d) {
     const nodeId = d;
@@ -997,8 +1425,6 @@ function drawForceGraph(data) {
 
     // 变暗所有非相关连线
     links.classed("dimmed", l => !neighbors.has(l.v) || !neighbors.has(l.w));
-
-    tippy(this, { content: `<b>${dagreGraph.node(d).type}</b><br>${dagreGraph.node(d).label || d}`, allowHTML: true });
   }).on("mouseleave", function () {
     // 恢复原状
     nodes.classed("dimmed", false);
@@ -1849,14 +2275,14 @@ function updateLegend() {
                   </div>`;
     });
   } else if (state.view === 'causal') {
-    // 因果图 - 显示节点类型（这些标签保持原样，因为是专业术语）
+    // 因果图 - 显示节点类型
     const causalLegend = {
-      'ConfirmedVulnerability': { color: '#f59e0b', label: currentLang === 'zh' ? '确认漏洞' : 'Confirmed Vuln' },
-      'Vulnerability': { color: '#a855f7', label: currentLang === 'zh' ? '疑似漏洞' : 'Vulnerability' },
-      'Evidence': { color: '#06b6d4', label: currentLang === 'zh' ? '证据' : 'Evidence' },
-      'Hypothesis': { color: '#84cc16', label: currentLang === 'zh' ? '假设' : 'Hypothesis' },
-      'KeyFact': { color: '#fbbf24', label: currentLang === 'zh' ? '关键事实' : 'Key Fact' },
-      'Flag': { color: '#ef4444', label: 'Flag' }
+      'ConfirmedVulnerability': { color: '#f59e0b', label: t('causal.confirmed_vuln') },
+      'Vulnerability': { color: '#a855f7', label: t('causal.vulnerability') },
+      'Evidence': { color: '#06b6d4', label: t('causal.evidence') },
+      'Hypothesis': { color: '#84cc16', label: t('causal.hypothesis') },
+      'KeyFact': { color: '#fbbf24', label: t('causal.keyfact') },
+      'Flag': { color: '#ef4444', label: t('causal.flag') }
     };
     Object.entries(causalLegend).forEach(([k, v]) => {
       h += `<div class="legend-item">
@@ -1871,9 +2297,7 @@ function updateLegend() {
 
 function showDetails(d) {
   const c = document.getElementById('node-detail-content');
-  let h = '';
-
-  // Header with Type and ID - 增强类型显示
+  state._detailData = d;
   const typeLabel = d.type === 'root' ? t('type.root') :
     d.type === 'task' ? t('type.task') :
       d.type === 'action' ? t('type.action') :
@@ -1882,71 +2306,498 @@ function showDetails(d) {
     d.type === 'task' ? '#8b5cf6' :
       d.type === 'action' ? '#f59e0b' :
         '#64748b';
-
-  h += `<div style="margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border-color)">
-          <div style="font-size:10px;text-transform:uppercase;color:${typeColor};font-weight:bold;display:inline-block;background:${typeColor}22;padding:2px 6px;border-radius:3px;">${typeLabel}</div>
-          <div style="font-size:14px;font-weight:bold;word-break:break-all;margin-top:6px;">${d.label || d.description || d.id}</div>
-          <div style="font-size:10px;color:var(--text-muted);margin-top:4px">ID: ${d.id}</div>
-        </div>`;
-
-  // Status Badge
   const statusColor = nodeColors[d.status] || '#64748b';
   const statusText = d.status ? t('status.' + d.status) || d.status : 'UNKNOWN';
-  h += `<div style="margin-bottom:16px"><span style="background:${statusColor};color:white;padding:2px 8px;border-radius:4px;font-size:10px;font-weight:bold;text-transform:uppercase">${statusText}</span></div>`;
 
-  // Tool Execution Details (if available) - 增强显示
-  if (d.tool_name || d.action) {
-    h += `<div class="detail-section" style="border:1px solid #f59e0b;border-radius:6px;padding:12px;margin-bottom:12px;background:rgba(245,158,11,0.05);">
-              <div class="detail-header" style="color:#f59e0b;margin-bottom:8px;">🔧 ${t('panel.tool')}</div>`;
+  let h = '';
+  // Header
+  h += `<div class="detail-header-bar">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+      <div>
+        <span class="detail-type-badge" style="background:${typeColor}22;color:${typeColor};border:1px solid ${typeColor}44;">${typeLabel}</span>
+        <span class="detail-status-badge" style="background:${statusColor}">${statusText}</span>
+      </div>
+      <div style="display:flex;gap:4px;">
+        <button class="btn btn-chat" onclick="openChatDialog('${escapeHtml(d.id)}')" title="Chat" style="font-size:11px;padding:2px 8px;">💬</button>
+      </div>
+    </div>
+    <div style="font-size:13px;font-weight:bold;word-break:break-word;margin-top:6px;">${d.label || d.description || d.id}</div>
+    <div style="font-size:10px;color:var(--text-muted);margin-top:2px;word-break:break-all;">ID: ${d.id}</div>
+  </div>`;
 
-    const toolName = d.tool_name || (d.action && d.action.tool);
-    if (toolName) {
-      h += `<div class="detail-row" style="margin-bottom:8px;">
-                  <span class="detail-key">${t('panel.tool')}:</span> 
-                  <span class="detail-val" style="color:#f59e0b;font-weight:bold;font-family:monospace;">${toolName}</span>
-                </div>`;
-    }
-
-    const toolArgs = d.tool_args || (d.action && d.action.params);
-    if (toolArgs) {
-      h += `<div class="detail-row" style="margin-bottom:4px;">
-                  <span class="detail-key">${t('panel.args')}:</span>
-                </div>
-                <div class="code-block" style="max-height:200px;overflow-y:auto;margin-bottom:8px;">${hlJson(toolArgs)}</div>`;
-    }
-
-    if (d.result) {
-      h += `<div class="detail-row" style="margin-bottom:4px;">
-                  <span class="detail-key">${t('panel.result')}:</span>
-                </div>
-                <div class="code-block" style="max-height:300px;overflow-y:auto;">${hlJson(d.result)}</div>`;
-    }
-
-    if (d.observation) {
-      h += `<div class="detail-row" style="margin-bottom:4px;margin-top:8px;">
-                  <span class="detail-key">${t('panel.observation')}:</span>
-                </div>
-                <div class="code-block" style="max-height:300px;overflow-y:auto;">${hlJson(d.observation)}</div>`;
-    }
-
-    h += `</div>`;
-  }
-
-  // Other Properties
-  h += `<div class="detail-section"><div class="detail-header">${t('panel.description')}</div><table class="detail-table">`;
-  Object.entries(d).forEach(([k, v]) => {
-    if (!['x', 'y', 'fx', 'fy', 'vx', 'vy', 'index', 'children', 'width', 'height', 'tool_name', 'tool_args', 'result', 'observation', 'action', 'label', 'id', 'type', 'status', 'description', 'original_type'].includes(k)) {
-      h += `<tr><td class="detail-key">${escapeHtml(k)}</td><td class="detail-val">${typeof v === 'object' ? hlJson(v) : escapeHtml(String(v))}</td></tr>`;
-    }
+  // Tab bar
+  const tabs = [
+    { id: 'overview', label: t('tab.overview') || '概览' },
+    { id: 'findings', label: t('tab.findings') || '发现' },
+    { id: 'evidence', label: t('tab.evidence') || '证据' },
+    { id: 'hypothesis', label: t('tab.hypothesis') || '假设' },
+    { id: 'raw', label: t('tab.raw') || '原始输出' },
+    { id: 'suggestions', label: t('tab.suggestions') || '建议' },
+  ];
+  h += `<div class="tab-bar">`;
+  tabs.forEach((tab, i) => {
+    h += `<button class="tab-btn ${i === 0 ? 'active' : ''}" onclick="switchDetailTab('${tab.id}', this)">${escapeHtml(tab.label)}</button>`;
   });
-  h += '</table></div>';
+  h += `</div>`;
+
+  // Tab panes
+  h += `<div class="tab-pane active" id="tab-overview">${renderOverviewTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-findings">${renderFindingsTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-evidence">${renderEvidenceTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-hypothesis">${renderHypothesisTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-raw">${renderRawTab(d)}</div>`;
+  h += `<div class="tab-pane" id="tab-suggestions">${renderSuggestionsTab(d)}</div>`;
 
   c.innerHTML = h;
   document.getElementById('node-details-panel').classList.add('show');
 }
 
+function switchDetailTab(tabName, btn) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  const pane = document.getElementById('tab-' + tabName);
+  if (pane) pane.classList.add('active');
+
+  if (tabName === 'hypothesis') {
+    loadHypotheses();
+  }
+}
+
+function renderOverviewTab(d) {
+  let h = '';
+  // Summary from observation
+  if (d.observation) {
+    h += `<div class="detail-section"><div class="section-title">${t('panel.observation') || '执行摘要'}</div>`;
+    if (typeof d.observation === 'object') {
+      h += `<div class="code-block">${hlJson(d.observation)}</div>`;
+    } else {
+      h += `<div style="font-size:12px;color:var(--text-main);line-height:1.6;">${escapeHtml(d.observation)}</div>`;
+    }
+    h += `</div>`;
+  }
+  // Tool info
+  if (d.tool_name || (d.action && d.action.tool)) {
+    const toolName = d.tool_name || d.action.tool;
+    h += `<div class="detail-section"><div class="section-title">🔧 ${t('panel.tool') || '工具'}</div>`;
+    h += `<div style="font-size:12px;color:#f59e0b;font-weight:bold;font-family:monospace;">${escapeHtml(toolName)}</div>`;
+    const toolArgs = d.tool_args || (d.action && d.action.params);
+    if (toolArgs) {
+      h += `<div style="font-size:11px;color:var(--text-muted);margin-top:4px;">${t('panel.params')}:</div><div class="code-block" style="max-height:150px;">${hlJson(toolArgs)}</div>`;
+    }
+    h += `</div>`;
+  }
+  // Description
+  if (d.description) {
+    h += `<div class="detail-section"><div class="section-title">${t('panel.description')}</div>`;
+    h += `<div style="font-size:12px;color:var(--text-main);">${escapeHtml(d.description)}</div></div>`;
+  }
+  // Goal
+  if (d.goal) {
+    h += `<div class="detail-section"><div class="section-title">${t('panel.goal')}</div>`;
+    h += `<div style="font-size:12px;color:var(--text-main);">${escapeHtml(d.goal)}</div></div>`;
+  }
+  if (!h) h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_overview')}</div>`;
+  return h;
+}
+
+function renderFindingsTab(d) {
+  const findings = d.findings || (d.data && d.data.findings) || [];
+  if (!findings || (Array.isArray(findings) && findings.length === 0)) {
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_findings')}</div>`;
+  }
+  // Group by category
+  const groups = {};
+  (Array.isArray(findings) ? findings : Object.values(findings)).forEach(f => {
+    const cat = (f.category || f.type || 'other').toLowerCase();
+    if (!groups[cat]) groups[cat] = [];
+    groups[cat].push(f);
+  });
+  let h = '';
+  Object.entries(groups).forEach(([cat, items]) => {
+    const catLabel = cat.replace(/_/g, ' ');
+    h += `<div class="finding-group"><div class="finding-group-title">${escapeHtml(catLabel)} (${items.length})</div>`;
+    items.forEach(item => {
+      const title = item.title || item.description || item.content || JSON.stringify(item).slice(0, 80);
+      const sev = (item.severity || item.level || '').toLowerCase();
+      const sevColors = { critical: '#ef4444', high: '#f59e0b', medium: '#eab308', low: '#84cc16', info: '#3b82f6' };
+      const sevColor = sevColors[sev] || '#64748b';
+      h += `<div class="finding-item">
+        <div class="finding-item-header">
+          <span style="color:var(--text-main);font-weight:500;font-size:12px;">${escapeHtml(String(title).slice(0, 100))}</span>
+          <span class="ev-cat-tag" style="background:${sevColor}22;color:${sevColor};border-color:${sevColor}44;">${escapeHtml(sev || 'info')}</span>
+        </div>
+        <div style="font-size:11px;color:var(--text-muted);margin-top:2px;">${escapeHtml(String(item.detail || item.evidence || '').slice(0, 200))}</div>
+      </div>`;
+      if (item.confidence !== undefined) {
+        h += `<div style="font-size:10px;color:var(--text-muted);margin-top:2px;">${t('panel.confidence_label')}: ${(item.confidence * 100).toFixed(0)}%</div>`;
+      }
+    });
+    h += `</div>`;
+  });
+  return h;
+}
+
+function renderEvidenceTab(d) {
+  const evIds = d.evidence_ids || (d.data && d.data.evidence_ids) || [];
+  if (!evIds || (Array.isArray(evIds) && evIds.length === 0)) {
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_evidence')}</div>`;
+  }
+  let h = `<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">${t('panel.evidence_count')} (${evIds.length})</div>`;
+  (Array.isArray(evIds) ? evIds : Object.keys(evIds)).forEach(id => {
+    h += `<div class="finding-item" style="cursor:pointer;" onclick="showEvidenceDetail('${escapeHtml(id)}')">
+      <div class="finding-item-header">
+        <span style="font-family:monospace;font-size:11px;">${escapeHtml(id)}</span>
+        <span style="font-size:10px;color:var(--accent-primary);">${t('panel.view')} →</span>
+      </div>
+    </div>`;
+  });
+  return h;
+}
+
+function renderRawTab(d) {
+  const raw = d.observation || (d.data && d.data.raw_output) || d.result;
+  if (!raw) {
+    return `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('panel.no_raw')}</div>`;
+  }
+  let content = (typeof raw === 'object') ? JSON.stringify(raw, null, 2) : String(raw);
+  // Truncate if too long
+  const MAX_RAW_LEN = 50000;
+  if (content.length > MAX_RAW_LEN) {
+    content = content.slice(0, MAX_RAW_LEN) + '\n\n... (output truncated, ' + content.length + ' bytes total)';
+  }
+  return `<div class="code-block" style="max-height:400px;overflow-y:auto;white-space:pre-wrap;font-size:11px;">${hlJson(content)}</div>`;
+}
+
+function renderSuggestionsTab(d) {
+  const findings = d.findings || (d.data && d.data.findings) || [];
+  const categories = new Set();
+  (Array.isArray(findings) ? findings : Object.values(findings)).forEach(f => {
+    const cat = (f.category || f.type || '').toLowerCase();
+    if (cat) categories.add(cat);
+  });
+  let h = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">' + t('suggestion.header') + '</div>';
+  if (categories.size === 0) {
+    h += `<div style="text-align:center;color:var(--text-muted);padding:20px;">${t('suggestion.no_data')}</div>`;
+    return h;
+  }
+  const suggestionMap = {
+    'open_port': [t('suggestion.open_port_1'), t('suggestion.open_port_2'), t('suggestion.open_port_3')],
+    'service': [t('suggestion.service_1'), t('suggestion.service_2'), t('suggestion.service_3')],
+    'subdomain': [t('suggestion.subdomain_1'), t('suggestion.subdomain_2'), t('suggestion.subdomain_3')],
+    'vuln': [t('suggestion.vuln_1'), t('suggestion.vuln_2'), t('suggestion.vuln_3')],
+    'url': [t('suggestion.url_1'), t('suggestion.url_2'), t('suggestion.url_3')],
+    'http_header': [t('suggestion.http_header_1'), t('suggestion.http_header_2'), t('suggestion.http_header_3')],
+    'technology': [t('suggestion.technology_1'), t('suggestion.technology_2'), t('suggestion.technology_3')],
+    'cms': [t('suggestion.cms_1'), t('suggestion.cms_2'), t('suggestion.cms_3')],
+    'email': [t('suggestion.email_1'), t('suggestion.email_2'), t('suggestion.email_3')],
+    'dns': [t('suggestion.dns_1'), t('suggestion.dns_2'), t('suggestion.dns_3')],
+  };
+  categories.forEach(cat => {
+    const suggestions = suggestionMap[cat] || [t('suggestion.fallback_1'), t('suggestion.fallback_2'), t('suggestion.fallback_3')];
+    h += `<div class="finding-group"><div class="finding-group-title">💡 ${escapeHtml(cat.replace(/_/g, ' '))}</div>`;
+    suggestions.forEach(s => {
+      h += `<div class="suggestion-item">• ${escapeHtml(s)}</div>`;
+    });
+    h += `</div>`;
+  });
+  return h;
+}
+
+function renderHypothesisTab(d) {
+  return '<div id="hypothesis-tab-content" style="padding:4px 0;"><div style="text-align:center;color:var(--text-muted);padding:20px;font-size:12px;">' + (t('msg.click_to_load') || '点击标签加载假设数据') + '</div></div>';
+}
+
+async function loadHypotheses() {
+  const container = document.getElementById('hypothesis-tab-content');
+  if (!container) return;
+  if (!state.op_id) {
+    container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.no_opid') || '未选择任务') + '</div>';
+    return;
+  }
+  container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.loading') || '加载中...') + '</div>';
+  try {
+    const data = await api('/api/ops/' + state.op_id + '/hypotheses');
+    container.innerHTML = renderHypothesisList(data.hypotheses || []);
+  } catch (e) {
+    container.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.load_failed') || '加载失败') + '</div>';
+  }
+}
+
+function renderHypothesisList(hypotheses) {
+  if (!hypotheses || hypotheses.length === 0) {
+    return '<div style="text-align:center;color:var(--text-muted);padding:20px;">' + (t('msg.no_hypotheses') || '暂无假设数据') + '</div>';
+  }
+  let h = '<div style="font-size:11px;color:var(--text-muted);margin-bottom:8px;">' + (t('panel.hypothesis_count') || '共') + ' ' + hypotheses.length + ' ' + (t('panel.hypothesis_sorted') || '条假设 (按置信度排序)') + '</div>';
+  hypotheses.forEach(hy => {
+    const status = (hy.status || 'PENDING').toUpperCase();
+    const statusColors = {
+      'PENDING': '#64748b',
+      'SUPPORTED': '#10b981',
+      'FALSIFIED': '#ef4444',
+      'CONTRADICTED': '#f59e0b',
+      'CONFIRMED': '#f59e0b'
+    };
+    const statusColor = statusColors[status] || '#64748b';
+
+    const confidence = hy.confidence !== undefined ? hy.confidence : 0;
+    let confColor = '#ef4444';
+    if (confidence > 0.7) confColor = '#10b981';
+    else if (confidence > 0.4) confColor = '#f59e0b';
+
+    h += `<div class="finding-item" style="margin-bottom:8px;">
+      <div class="finding-item-header" style="margin-bottom:4px;">
+        <span style="font-weight:500;font-size:12px;color:var(--text-main);">${escapeHtml(hy.description || hy.id || t('panel.no_hypothesis'))}</span>
+        <span class="ev-cat-tag" style="background:${statusColor}22;color:${statusColor};border:1px solid ${statusColor}44;">${escapeHtml(status)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:4px;">
+        <span style="font-size:10px;color:var(--text-muted);">${t('panel.confidence_label')}</span>
+        <div style="flex:1;height:6px;background:rgba(100,116,139,0.3);border-radius:3px;overflow:hidden;">
+          <div style="width:${(confidence * 100).toFixed(0)}%;height:100%;background:${confColor};border-radius:3px;"></div>
+        </div>
+        <span style="font-size:11px;font-weight:bold;color:${confColor};">${(confidence * 100).toFixed(0)}%</span>
+      </div>
+    </div>`;
+  });
+  return h;
+}
+
 function closeDetails() {
   document.getElementById('node-details-panel').classList.remove('show');
+}
+
+// ===== Chat Dialog Functions =====
+
+function openChatDialog(nodeId) {
+  let dialog = document.getElementById('chat-dialog');
+  if (!dialog) {
+    dialog = document.createElement('div');
+    dialog.id = 'chat-dialog';
+    dialog.className = 'chat-dialog';
+    dialog.innerHTML = `<div class="chat-header">
+      <span id="chat-title">Chat</span>
+      <button class="chat-close-btn" onclick="closeChatDialog()">✕</button>
+    </div>
+    <div class="chat-messages" id="chat-messages">
+      <div class="chat-msg system-msg">您好！我是只读助手，可以回答关于此任务的任何问题。</div>
+    </div>
+    <div class="chat-quick-qs">
+      <button class="chat-q-btn" onclick="askChat('当前进度？')">当前进度？</button>
+      <button class="chat-q-btn" onclick="askChat('关键发现？')">关键发现？</button>
+      <button class="chat-q-btn" onclick="askChat('下一步？')">下一步？</button>
+    </div>
+    <div class="chat-input-area">
+      <input type="text" id="chat-input" placeholder="输入问题..." onkeydown="if(event.key==='Enter')askChat(this.value)">
+      <button class="chat-send-btn" onclick="askChat(document.getElementById('chat-input').value)">发送</button>
+    </div>`;
+    document.body.appendChild(dialog);
+  }
+  dialog.style.display = 'flex';
+  document.getElementById('chat-title').textContent = `Chat: ${nodeId}`;
+  state._chatNodeId = nodeId;
+}
+
+function closeChatDialog() {
+  const dialog = document.getElementById('chat-dialog');
+  if (dialog) dialog.style.display = 'none';
+}
+
+async function askChat(question) {
+  if (!question || !question.trim()) return;
+  const msgArea = document.getElementById('chat-messages');
+  const input = document.getElementById('chat-input');
+  const q = question.trim();
+  input.value = '';
+
+  // User message
+  const userMsg = document.createElement('div');
+  userMsg.className = 'chat-msg user-msg';
+  userMsg.textContent = q;
+  msgArea.appendChild(userMsg);
+  msgArea.scrollTop = msgArea.scrollHeight;
+
+  // Assistant message (streaming)
+  const assistMsg = document.createElement('div');
+  assistMsg.className = 'chat-msg assist-msg';
+  assistMsg.textContent = '';
+  msgArea.appendChild(assistMsg);
+
+  try {
+    const resp = await fetch(`/api/ops/${state.op_id}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question: q })
+    });
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const payload = line.slice(6).trim();
+          if (payload === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(payload);
+            if (parsed.content) {
+              assistMsg.textContent += parsed.content;
+              msgArea.scrollTop = msgArea.scrollHeight;
+            }
+          } catch (e) { /* skip partial lines */ }
+        }
+      }
+    }
+  } catch (e) {
+    assistMsg.textContent = 'Error: ' + e.message;
+  }
+}
+
+// ===== Evidence View Functions =====
+
+function openEvidenceView() {
+  const main = document.getElementById('main');
+  let evView = document.getElementById('evidence-view');
+  if (!evView) {
+    evView = document.createElement('div');
+    evView.id = 'evidence-view';
+    evView.innerHTML = `<div class="ev-toolbar">
+      <span class="ev-title">证据浏览器</span>
+      <button class="btn" onclick="closeEvidenceView()" style="font-size:12px;">✕ 关闭</button>
+    </div>
+    <div class="ev-body">
+      <div class="ev-filter">
+        <input type="text" id="ev-search" placeholder="搜索证据..." oninput="applyEvidenceFilter()">
+        <select id="ev-cat-filter" onchange="applyEvidenceFilter()">
+          <option value="">全部类别</option>
+          <option value="open_port">开放端口</option>
+          <option value="service">服务</option>
+          <option value="subdomain">子域名</option>
+          <option value="vuln">漏洞</option>
+          <option value="url">URL</option>
+          <option value="http_header">HTTP头</option>
+        </select>
+      </div>
+      <div class="ev-list" id="ev-list">
+        <div style="text-align:center;color:var(--text-muted);padding:40px;">加载中...</div>
+      </div>
+      <div class="ev-detail" id="ev-detail">
+        <div style="text-align:center;color:var(--text-muted);padding:40px;">选择一个证据查看详情</div>
+      </div>
+    </div>`;
+    main.appendChild(evView);
+  }
+  evView.style.display = 'flex';
+  loadEvidence();
+}
+
+function closeEvidenceView() {
+  const evView = document.getElementById('evidence-view');
+  if (evView) evView.style.display = 'none';
+}
+
+async function loadEvidence() {
+  const list = document.getElementById('ev-list');
+  list.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">加载中...</div>';
+  try {
+    const data = await fetch(`/api/ops/${state.op_id}/evidence?op_id=${state.op_id}`).then(r => r.json());
+    state._allEvidence = data.evidence || [];
+    renderEvidenceList(state._allEvidence);
+  } catch (e) {
+    list.innerHTML = '<div style="text-align:center;color:#ef4444;padding:40px;">加载失败</div>';
+  }
+}
+
+function applyEvidenceFilter() {
+  const search = (document.getElementById('ev-search').value || '').toLowerCase();
+  const cat = document.getElementById('ev-cat-filter').value;
+  let filtered = state._allEvidence || [];
+  if (search) {
+    filtered = filtered.filter(e => JSON.stringify(e).toLowerCase().includes(search));
+  }
+  if (cat) {
+    filtered = filtered.filter(e => (e.category || e.type || '').toLowerCase() === cat.toLowerCase());
+  }
+  renderEvidenceList(filtered);
+}
+
+function renderEvidenceList(items) {
+  const list = document.getElementById('ev-list');
+  if (!items || items.length === 0) {
+    list.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">暂无证据</div>';
+    return;
+  }
+  let h = '';
+  const catColors = {
+    open_port: '#3b82f6', service: '#8b5cf6', subdomain: '#06b6d4',
+    vuln: '#ef4444', url: '#84cc16', http_header: '#f59e0b'
+  };
+  items.forEach(e => {
+    const cat = e.category || e.type || 'other';
+    const color = catColors[cat] || '#64748b';
+    h += `<div class="ev-list-item" onclick="showEvidenceDetail('${escapeHtml(e.id || '')}')">
+      <div class="ev-list-item-header">
+        <span class="ev-cat-tag" style="background:${color}22;color:${color};border:1px solid ${color}44;">${escapeHtml(cat)}</span>
+        <span style="font-size:11px;font-weight:500;color:var(--text-main);">${escapeHtml(e.title || e.content || e.id || 'Unknown')}</span>
+      </div>
+      <div style="font-size:10px;color:var(--text-muted);margin-top:2px;">
+        ${escapeHtml(String(e.content || e.description || '').slice(0, 120))}
+        ${e.confidence !== undefined ? ` | 置信度: ${(e.confidence * 100).toFixed(0)}%` : ''}
+      </div>
+    </div>`;
+  });
+  list.innerHTML = h;
+}
+
+async function showEvidenceDetail(evidenceId) {
+  if (!evidenceId) return;
+  const detail = document.getElementById('ev-detail');
+  detail.innerHTML = '<div style="text-align:center;color:var(--text-muted);padding:40px;">加载中...</div>';
+  try {
+    const [evData, chainData] = await Promise.all([
+      fetch(`/api/evidence/${evidenceId}`).then(r => r.json()),
+      fetch(`/api/evidence/${evidenceId}/chain`).then(r => r.json())
+    ]);
+    let h = '';
+    // Evidence info
+    h += `<div class="ev-detail-section">
+      <div style="font-weight:600;margin-bottom:8px;">${escapeHtml(evData.id || evidenceId)}</div>
+      <div style="font-size:12px;color:var(--text-main);margin-bottom:4px;">类别: ${escapeHtml(evData.category || 'unknown')}</div>
+      <div style="font-size:12px;color:var(--text-main);margin-bottom:4px;">内容: ${escapeHtml(String(evData.content || ''))}</div>
+      ${evData.confidence !== undefined ? `<div style="font-size:12px;color:var(--text-main);">置信度: ${(evData.confidence * 100).toFixed(0)}%</div>` : ''}
+    </div>`;
+    // Causal chain
+    if (chainData.nodes && chainData.nodes.length > 0) {
+      h += `<div class="ev-detail-section"><div style="font-weight:600;margin-bottom:8px;">因果链</div>
+      <div class="causal-chain">`;
+      chainData.nodes.forEach((n, i) => {
+        const colors = { Evidence: '#06b6d4', Hypothesis: '#84cc16', Vulnerability: '#a855f7', ConfirmedVulnerability: '#f59e0b', Flag: '#ef4444', KeyFact: '#fbbf24' };
+        const c = colors[n.node_type] || '#64748b';
+        h += `<div class="causal-chain-node" style="border-color:${c};">
+          <span class="ev-cat-tag" style="background:${c}22;color:${c};">${escapeHtml(n.node_type || 'node')}</span>
+          <span style="font-size:11px;">${escapeHtml(n.label || n.id || '')}</span>
+        </div>`;
+        if (i < chainData.nodes.length - 1) {
+          h += `<div class="causal-chain-arrow">↓</div>`;
+        }
+      });
+      h += `</div></div>`;
+    }
+    if (chainData.edges && chainData.edges.length > 0) {
+      h += `<div class="ev-detail-section"><div style="font-weight:600;margin-bottom:8px;">关系 (${chainData.edges.length})</div>`;
+      chainData.edges.forEach(e => {
+        h += `<div style="font-size:11px;color:var(--text-muted);margin-bottom:2px;">${escapeHtml(e.source || '')} → ${escapeHtml(e.target || '')} <span style="color:#64748b;">[${escapeHtml(e.label || e.type || 'related')}]</span></div>`;
+      });
+      h += `</div>`;
+    }
+    detail.innerHTML = h;
+  } catch (e) {
+    detail.innerHTML = `<div style="text-align:center;color:#ef4444;padding:40px;">加载失败: ${escapeHtml(e.message)}</div>`;
+  }
 }
 
 // 初始化节点详情窗口拖动功能
@@ -1997,10 +2848,6 @@ function initPanelDrag() {
   });
 }
 
-// 页面加载后初始化拖动
-document.addEventListener('DOMContentLoaded', () => {
-  initPanelDrag();
-});
 
 function subscribe() {
   state.es = new EventSource(`/api/events?op_id=${state.op_id}`);
@@ -2012,12 +2859,19 @@ function subscribe() {
       const eventType = msg.event || 'message';
 
       // 对于已完成的任务，跳过图形刷新事件（减少不必要的渲染）
-      if (eventType === 'graph.changed' || eventType === 'execution.step.completed') {
+      if (eventType === 'graph.changed' || eventType === 'graph.synced' || eventType === 'execution.step.completed') {
         if (!state.missionAccomplished) {
           render();
         }
+        // Throttled refresh of task list to update card status/progress
+        if (!opsRefreshDebounce) {
+          opsRefreshDebounce = setTimeout(() => {
+            loadOps();
+            opsRefreshDebounce = null;
+          }, 2000);
+        }
       }
-      if (eventType === 'ping' || eventType === 'graph.ready') return;
+      if (eventType === 'ping' || eventType === 'graph.ready' || eventType === 'graph.synced') return;
 
       // 分流渲染（实时事件）
       if (eventType.startsWith('llm.')) {
@@ -2039,7 +2893,7 @@ function subscribe() {
 
 // 专门处理系统/执行事件 (execution.step.completed, graph.changed, etc)
 function renderSystemEvent(msg) {
-  const id = (msg.timestamp || 0) + '_' + msg.event;
+  const id = (msg.timestamp || 0) + '_' + msg.event + '_' + Math.random().toString(36).substr(2, 5);
   if (state.processedEvents.has(id)) return;
   state.processedEvents.add(id);
 
@@ -2047,6 +2901,11 @@ function renderSystemEvent(msg) {
   const div = document.createElement('div');
   // 使用 role-system 样式
   div.className = 'llm-msg role-system';
+  div.dataset.category = 'system';
+  div.dataset.searchText = JSON.stringify(msg);
+  if (!matchesLogFilter(msg, 'SYSTEM')) {
+    div.style.display = 'none';
+  }
 
   const time = new Date(msg.timestamp ? msg.timestamp * 1000 : Date.now()).toLocaleTimeString();
   const eventType = msg.event;
@@ -2112,7 +2971,7 @@ function renderSystemEvent(msg) {
 
 // 专门处理 LLM 响应
 function renderLLMResponse(msg, isHistory = false) {
-  const id = (msg.timestamp || Date.now()) + '_' + msg.event;
+  const id = (msg.timestamp || Date.now()) + '_' + msg.event + '_' + Math.random().toString(36).substr(2, 5);
   if (state.processedEvents.has(id)) return;
   state.processedEvents.add(id);
 
@@ -2188,6 +3047,12 @@ function renderLLMResponse(msg, isHistory = false) {
   const container = document.getElementById('llm-stream');
   const div = document.createElement('div');
   div.className = `llm-msg ${roleClass}`;
+  const logCategory = getLogCategory(msg, roleName);
+  div.dataset.category = logCategory;
+  div.dataset.searchText = JSON.stringify(msg);
+  if (!matchesLogFilter(msg, roleName)) {
+    div.style.display = 'none';
+  }
 
   const time = new Date(msg.timestamp ? msg.timestamp * 1000 : Date.now()).toLocaleTimeString();
 
@@ -2221,7 +3086,7 @@ function renderLLMResponse(msg, isHistory = false) {
         ? '#10b981'
         : (normalizedAuditStatus === 'failed' ? '#ef4444' : '#f59e0b');
       htmlContent += `<div class="thought-card" style="border-left-color:${statusColor}">
-              <div class="thought-title" style="color:${statusColor}">Audit: ${escapeHtml(audit.status.toUpperCase())}</div>
+              <div class="thought-title" style="color:${statusColor}">Audit: ${escapeHtml((audit.status || 'UNKNOWN').toUpperCase())}</div>
               <div style="margin-bottom:6px;">${escapeHtml(audit.completion_check || '')}</div>
           </div>`;
       delete remaining.audit_result;
@@ -2266,10 +3131,16 @@ function renderLLMResponse(msg, isHistory = false) {
 
     // Remaining Data Dump (Collapsible)
     if (Object.keys(remaining).length > 0) {
+      let remainingJson;
+      try {
+        remainingJson = JSON.stringify(remaining, null, 2);
+      } catch (e) {
+        remainingJson = '[Object with circular reference]';
+      }
       htmlContent += `
           <div class="log-group">
               <div class="log-summary" onclick="this.parentElement.classList.toggle('open')">Other Data</div>
-              <div class="log-details"><div class="raw-data-content">${hlJson(JSON.stringify(remaining, null, 2))}</div></div>
+              <div class="log-details"><div class="raw-data-content">${hlJson(remainingJson)}</div></div>
           </div>`;
     }
 
@@ -2321,9 +3192,99 @@ function openCreateTaskModal() {
   document.getElementById('create-llm-reflector').value = '';
   document.getElementById('advanced-content').style.display = 'none';
   document.getElementById('advanced-arrow').style.transform = 'rotate(0deg)';
+  document.getElementById('scope-content').style.display = 'none';
+  document.getElementById('scope-arrow').style.transform = 'rotate(0deg)';
+  resetScopeForm();
+  state.scopePanelOpened = false;
   updateHitlLabel();
   // 聚焦到目标输入框
   setTimeout(() => document.getElementById('create-goal').focus(), 100);
+}
+
+// 重置 Scope 表单
+function resetScopeForm() {
+  document.getElementById('scope-allowed-targets').value = '';
+  document.getElementById('scope-blocked-targets').value = '';
+  document.getElementById('scope-allowed-ports').value = '';
+  document.getElementById('scope-disabled-tools').value = '';
+  document.getElementById('scope-max-response-size').value = '';
+  document.getElementById('scope-rate-limit').value = '';
+  document.getElementById('scope-disable-shell').checked = false;
+  document.getElementById('scope-disable-python').checked = false;
+  document.getElementById('scope-block-private').checked = false;
+  document.getElementById('scope-block-udp-full').checked = false;
+  document.getElementById('scope-block-tcp-full').checked = false;
+  document.getElementById('scope-block-udp-syn').checked = false;
+}
+
+// 切换 Scope 配置展开/折叠
+function toggleScopeConfig() {
+  const content = document.getElementById('scope-content');
+  const arrow = document.getElementById('scope-arrow');
+  if (content.style.display === 'none') {
+    content.style.display = 'block';
+    arrow.style.transform = 'rotate(180deg)';
+    state.scopePanelOpened = true;
+  } else {
+    content.style.display = 'none';
+    arrow.style.transform = 'rotate(0deg)';
+  }
+}
+
+// 加载默认 Scope 配置
+async function loadScopeDefaults() {
+  try {
+    const data = await fetch('/api/scope-defaults').then(r => r.json());
+    const defaults = data.defaults || {};
+    document.getElementById('scope-allowed-targets').value = (defaults.allowed_targets || []).join(', ');
+    document.getElementById('scope-blocked-targets').value = (defaults.blocked_targets || []).join(', ');
+    document.getElementById('scope-allowed-ports').value = (defaults.allowed_ports || []).join(', ');
+    document.getElementById('scope-disabled-tools').value = (defaults.disabled_tools || []).join(', ');
+    document.getElementById('scope-max-response-size').value = defaults.max_response_size || '';
+    document.getElementById('scope-rate-limit').value = defaults.rate_limit_requests_per_sec || '';
+    document.getElementById('scope-disable-shell').checked = !!defaults.disable_shell_exec;
+    document.getElementById('scope-disable-python').checked = !!defaults.disable_python_exec;
+    document.getElementById('scope-block-private').checked = !!defaults.block_private_network;
+    // 加载扫描类型限制
+    const blockedScanTypes = defaults.blocked_scan_types || [];
+    document.getElementById('scope-block-udp-full').checked = blockedScanTypes.includes('udp_full');
+    document.getElementById('scope-block-tcp-full').checked = blockedScanTypes.includes('tcp_full');
+    document.getElementById('scope-block-udp-syn').checked = blockedScanTypes.includes('udp_syn');
+    state.scopePanelOpened = true;
+  } catch (e) {
+    console.error('Failed to load scope defaults:', e);
+    alert(currentLang === 'zh' ? '加载默认值失败' : 'Failed to load defaults');
+  }
+}
+
+// 从表单收集 Scope 配置
+function collectScopeConfig() {
+  const parseList = (val) => val.split(',').map(s => s.trim()).filter(Boolean);
+  const config = {};
+  const allowedTargets = document.getElementById('scope-allowed-targets').value.trim();
+  const blockedTargets = document.getElementById('scope-blocked-targets').value.trim();
+  const allowedPorts = document.getElementById('scope-allowed-ports').value.trim();
+  const disabledTools = document.getElementById('scope-disabled-tools').value.trim();
+  const maxResponseSize = document.getElementById('scope-max-response-size').value.trim();
+  const rateLimit = document.getElementById('scope-rate-limit').value.trim();
+
+  if (allowedTargets) config.allowed_targets = parseList(allowedTargets);
+  if (blockedTargets) config.blocked_targets = parseList(blockedTargets);
+  if (allowedPorts) config.allowed_ports = parseList(allowedPorts).map(Number);
+  if (disabledTools) config.disabled_tools = parseList(disabledTools);
+  if (maxResponseSize) config.max_response_size = Number(maxResponseSize);
+  if (rateLimit) config.rate_limit_requests_per_sec = Number(rateLimit);
+  config.disable_shell_exec = document.getElementById('scope-disable-shell').checked;
+  config.disable_python_exec = document.getElementById('scope-disable-python').checked;
+  config.block_private_network = document.getElementById('scope-block-private').checked;
+  // 收集扫描类型限制
+  const blockedScanTypes = [];
+  if (document.getElementById('scope-block-udp-full').checked) blockedScanTypes.push('udp_full');
+  if (document.getElementById('scope-block-tcp-full').checked) blockedScanTypes.push('tcp_full');
+  if (document.getElementById('scope-block-udp-syn').checked) blockedScanTypes.push('udp_syn');
+  if (blockedScanTypes.length > 0) config.blocked_scan_types = blockedScanTypes;
+
+  return config;
 }
 
 // 切换高级配置展开/折叠
@@ -2352,16 +3313,16 @@ function updateHitlLabel() {
   }
 }
 
-// 监听人机协同复选框变化
-document.addEventListener('DOMContentLoaded', () => {
-  const hitlCheckbox = document.getElementById('create-hitl');
-  if (hitlCheckbox) {
-    hitlCheckbox.addEventListener('change', updateHitlLabel);
-  }
-});
 
 // 提交创建任务
 async function submitCreateTask() {
+  // 防重复提交
+  if (state.creatingTask) {
+    console.log('Task creation already in progress, ignoring duplicate click');
+    return;
+  }
+  state.creatingTask = true;
+
   const goal = document.getElementById('create-goal').value.trim();
   const taskName = document.getElementById('create-taskname').value.trim();
   const hitl = document.getElementById('create-hitl').checked;
@@ -2373,6 +3334,7 @@ async function submitCreateTask() {
   if (!goal) {
     alert(currentLang === 'zh' ? '请输入任务目标' : 'Please enter a task goal');
     document.getElementById('create-goal').focus();
+    state.creatingTask = false;
     return;
   }
 
@@ -2391,6 +3353,20 @@ async function submitCreateTask() {
   try {
     const r = await api('/api/ops', payload);
     if (r.ok) {
+      // 保存 Scope 配置（仅当用户打开了 Scope 面板时）
+      if (state.scopePanelOpened) {
+        const scopeConfig = collectScopeConfig();
+        try {
+          await fetch(`/api/ops/${r.op_id}/scope`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ scope_config: scopeConfig })
+          });
+        } catch (scopeErr) {
+          console.error('Failed to save scope config:', scopeErr);
+        }
+      }
+
       closeModals();
       // 等待任务列表刷新完成
       await loadOps();
@@ -2414,9 +3390,13 @@ async function submitCreateTask() {
         ? `任务已启动！${hitl ? '（人机协同模式）' : ''}`
         : `Task started!${hitl ? ' (HITL mode)' : ''}`;
       console.log(msg, r);
+    } else {
+      alert(currentLang === 'zh' ? `创建任务失败: ${r.error || '未知错误'}` : `Failed to create task: ${r.error || 'Unknown error'}`);
     }
   } catch (e) {
     alert(currentLang === 'zh' ? `创建任务失败: ${e}` : `Failed to create task: ${e}`);
+  } finally {
+    state.creatingTask = false;
   }
 }
 
@@ -2624,6 +3604,74 @@ function toggleLeftSidebar() {
   });
 }
 
+// Sidebar resize handle logic
+(function initSidebarResizer() {
+  const SIDEBAR_MIN_WIDTH = 180;
+  const SIDEBAR_MAX_WIDTH = 600;
+  const STORAGE_KEY = 'sidebar_width';
+
+  function setupResizer() {
+    const resizer = document.getElementById('sidebar-resizer');
+    const sidebar = document.getElementById('sidebar');
+    if (!resizer || !sidebar) return;
+
+    let startX = 0;
+    let startWidth = 0;
+
+    function onMouseMove(e) {
+      const dx = e.clientX - startX;
+      let newWidth = startWidth + dx;
+      newWidth = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, newWidth));
+      sidebar.style.width = newWidth + 'px';
+      sidebar.style.minWidth = newWidth + 'px';
+      sidebar.style.flexBasis = newWidth + 'px';
+      sidebar.style.maxWidth = newWidth + 'px';
+      // Prevent text selection while dragging
+      e.preventDefault();
+    }
+
+    function onMouseUp() {
+      resizer.classList.remove('resizing');
+      document.removeEventListener('mousemove', onMouseMove);
+      document.removeEventListener('mouseup', onMouseUp);
+      document.body.style.userSelect = '';
+      const width = parseInt(sidebar.style.width, 10);
+      if (width) {
+        localStorage.setItem(STORAGE_KEY, String(width));
+      }
+    }
+
+    resizer.addEventListener('mousedown', (e) => {
+      if (sidebar.classList.contains('collapsed')) return;
+      e.preventDefault();
+      startX = e.clientX;
+      startWidth = sidebar.offsetWidth;
+      resizer.classList.add('resizing');
+      document.body.style.userSelect = 'none';
+      document.addEventListener('mousemove', onMouseMove);
+      document.addEventListener('mouseup', onMouseUp);
+    });
+
+    // Restore saved width on init
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (saved) {
+      const width = parseInt(saved, 10);
+      if (width >= SIDEBAR_MIN_WIDTH && width <= SIDEBAR_MAX_WIDTH) {
+        sidebar.style.width = width + 'px';
+        sidebar.style.minWidth = width + 'px';
+        sidebar.style.flexBasis = width + 'px';
+        sidebar.style.maxWidth = width + 'px';
+      }
+    }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', setupResizer);
+  } else {
+    setupResizer();
+  }
+})();
+
 // Toggle right sidebar (Agent Logs)
 function toggleRightSidebar() {
   state.rightSidebarCollapsed = !state.rightSidebarCollapsed;
@@ -2647,4 +3695,91 @@ function toggleRightSidebar() {
       }
     }, 280);
   });
+}
+
+// ===== Node Context Menu & Restart =====
+
+function showNodeContextMenu(nodeId, event) {
+  event.preventDefault();
+  event.stopPropagation();
+
+  // 移除已有的上下文菜单
+  hideNodeContextMenu();
+
+  const menu = document.createElement('div');
+  menu.id = 'node-context-menu';
+  menu.className = 'node-context-menu';
+
+  const isZh = (window.currentLang || 'zh') === 'zh';
+
+  menu.innerHTML = `
+    <div class="node-context-item" onclick="restartNode('${escapeHtml(nodeId)}', false); hideNodeContextMenu();">
+      ${isZh ? '仅重启此节点' : 'Restart this node only'}
+    </div>
+    <div class="node-context-item" onclick="restartNode('${escapeHtml(nodeId)}', true); hideNodeContextMenu();">
+      ${isZh ? '重启此节点及下游' : 'Restart this node & downstream'}
+    </div>
+  `;
+
+  document.body.appendChild(menu);
+
+  // 定位菜单
+  const menuWidth = menu.offsetWidth || 160;
+  const menuHeight = menu.offsetHeight || 80;
+  let left = event.pageX;
+  let top = event.pageY;
+
+  if (left + menuWidth > window.innerWidth) {
+    left = window.innerWidth - menuWidth - 8;
+  }
+  if (top + menuHeight > window.innerHeight) {
+    top = window.innerHeight - menuHeight - 8;
+  }
+
+  menu.style.left = left + 'px';
+  menu.style.top = top + 'px';
+
+  // 点击其他地方关闭菜单
+  setTimeout(() => {
+    document.addEventListener('click', hideNodeContextMenu, { once: true });
+  }, 10);
+}
+
+function hideNodeContextMenu() {
+  const menu = document.getElementById('node-context-menu');
+  if (menu) menu.remove();
+}
+
+async function restartNode(nodeId, cascade) {
+  if (!state.op_id) return;
+
+  const isZh = (window.currentLang || 'zh') === 'zh';
+  const ok = await showConfirmModal({
+    title: isZh ? '重启节点' : 'Restart Node',
+    message: isZh
+      ? `确定要重启节点 ${nodeId} 吗？${cascade ? '（包含下游节点）' : ''}`
+      : `Are you sure you want to restart node ${nodeId}? ${cascade ? '(including downstream)' : ''}`,
+    confirmText: isZh ? '重启' : 'Restart',
+    cancelText: isZh ? '取消' : 'Cancel',
+    danger: true
+  });
+  if (!ok) return;
+
+  try {
+    const r = await fetch(`/api/node/${nodeId}/restart?op_id=${state.op_id}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cascade })
+    }).then(res => res.json());
+
+    if (r.success) {
+      console.log('Node restarted:', nodeId, 'reset_count:', r.reset_count, 'reset_ids:', r.reset_ids);
+      render(true);
+    } else {
+      alert(isZh ? '重启失败' : 'Restart failed');
+    }
+  } catch (e) {
+    console.error('Restart failed:', e);
+    alert(isZh ? `重启失败: ${e.message}` : `Restart failed: ${e.message}`);
+  }
 }

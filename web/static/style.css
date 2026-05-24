@@ -225,11 +225,15 @@ body {
 
 #sidebar {
   width: 280px;
+  min-width: 280px;
+  max-width: 600px;
   background: var(--bg-app);
   border-right: 1px solid var(--border-color);
   display: flex;
   flex-direction: column;
   flex-shrink: 0;
+  box-sizing: border-box;
+  overflow: hidden;
   will-change: transform;
   transform: translateX(0);
   transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
@@ -240,6 +244,44 @@ body {
   width: 0;
   min-width: 0;
   border-right: none;
+}
+
+#sidebar-resizer {
+  width: 6px;
+  background: rgba(148, 163, 184, 0.12);
+  cursor: col-resize;
+  flex-shrink: 0;
+  transition: background 0.15s;
+  z-index: 10;
+  position: relative;
+}
+
+#sidebar-resizer::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 2px;
+  height: 24px;
+  border-radius: 1px;
+  background: rgba(148, 163, 184, 0.35);
+}
+
+#sidebar-resizer:hover,
+#sidebar-resizer.resizing {
+  background: var(--accent-primary);
+}
+
+#sidebar-resizer:hover::after,
+#sidebar-resizer.resizing::after {
+  background: rgba(255, 255, 255, 0.8);
+}
+
+@media (max-width: 768px) {
+  #sidebar-resizer {
+    display: none;
+  }
 }
 
 #main {

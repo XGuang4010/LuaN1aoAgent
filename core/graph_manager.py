@@ -58,7 +58,7 @@ class GraphManager:
     (支持 SQLite 持久化)
     """
 
-    def __init__(self, task_id: str, goal: str, op_id: Optional[str] = None):
+    def __init__(self, task_id: str, goal: str, op_id: Optional[str] = None, _skip_db_init: bool = False):
         self.task_id = task_id
         self.graph = nx.DiGraph()
         self.causal_graph = nx.DiGraph()
@@ -73,7 +73,7 @@ class GraphManager:
         self._shared_findings_read_cursors: Dict[str, int] = {}  # subtask_id -> 已读条数
         
         # Initialize session in DB if op_id is provided
-        if self.op_id:
+        if self.op_id and not _skip_db_init:
             schedule_coroutine(create_session(
                 session_id=self.op_id,
                 name=task_id,
@@ -81,7 +81,7 @@ class GraphManager:
                 config={}
             ))
             
-        self.initialize_graph(goal)
+        self.initialize_graph(goal, _skip_db_init=_skip_db_init)
 
     def set_op_id(self, op_id: str):
         """Set the operation ID for event emission and DB persistence."""
@@ -89,12 +89,12 @@ class GraphManager:
         # Note: We assume the session is created elsewhere if set late, 
         # or we could trigger a create_session here too if needed.
 
-    def initialize_graph(self, goal: str) -> None:
+    def initialize_graph(self, goal: str, _skip_db_init: bool = False) -> None:
         """初始化图，添加代表整体任务的根节点."""
         node_data = {"type": "task", "goal": goal, "status": "in_progress"}
         self.graph.add_node(self.task_id, **node_data)
         
-        if self.op_id:
+        if self.op_id and not _skip_db_init:
             schedule_coroutine(upsert_node(self.op_id, self.task_id, 'task', node_data))
 
     def _touch_causal_graph(self) -> None:
@@ -307,6 +307,31 @@ class GraphManager:
             del payload["id"]
         
         return self.add_causal_node(payload)
+
+    def add_evidence(
+        self,
+        evidence_id: str,
+        category: str,
+        content: str | dict,
+        source_step: str,
+        confidence: float,
+        hypothesis_id: str | None = None,
+    ) -> str:
+        """Create an Evidence node via add_causal_node() and link to source step."""
+        artifact = {
+            "id": evidence_id,
+            "node_type": "Evidence",
+            "category": category,
+            "content": str(content)[:500] if isinstance(content, str) else str(content)[:500],
+            "source_step_id": source_step,
+            "confidence": confidence,
+            "raw_output": str(content)[:500],
+            "hypothesis_id": hypothesis_id or "",
+        }
+        node_id = self.add_causal_node(artifact)
+        if source_step and self.causal_graph.has_node(source_step):
+            self.add_causal_edge(source_step, node_id, "PRODUCES", confidence=confidence)
+        return node_id
 
     def add_causal_edge_obj(self, edge: "CausalEdge") -> None:
         if not hasattr(edge, "source_id") or not hasattr(edge, "target_id"):
@@ -954,15 +979,15 @@ class GraphManager:
 
         return context
 
-    def add_subtask_node(self, subtask_id: str, description: str, dependencies: List[str], priority: int = 1, reason: str = "", completion_criteria: str = "", mission_briefing: Optional[Dict] = None, max_steps: Optional[int] = None):
+    def add_subtask_node(self, subtask_id: str, description: str, dependencies: List[str], priority: int = 1, reason: str = "", completion_criteria: str = "", mission_briefing: Optional[Dict] = None, max_steps: Optional[int] = None, extra_data: Optional[Dict] = None):
         if self.graph.has_node(subtask_id):
             logging.warning("GraphManager.add_subtask_node: node %s already exists, skip.", subtask_id)
             return
 
-        self.graph.add_node(
-            subtask_id,
-            **self._build_subtask_payload(description, priority, reason, completion_criteria, mission_briefing, max_steps),
-        )
+        payload = self._build_subtask_payload(description, priority, reason, completion_criteria, mission_briefing, max_steps)
+        if extra_data:
+            payload["extra_data"] = extra_data
+        self.graph.add_node(subtask_id, **payload)
         self._ensure_node_defaults(subtask_id)
         self._sync_node(subtask_id, 'task')
 
@@ -1925,3 +1950,156 @@ class GraphManager:
                 return True
 
         return False
+
+    def _get_downstream_nodes(self, node_id: str) -> list[str]:
+        """使用 BFS（非递归）查找任务图中指定节点的所有下游节点。"""
+        if not self.graph.has_node(node_id):
+            return []
+
+        downstream: list[str] = []
+        visited: set[str] = set()
+        queue = [node_id]
+
+        while queue:
+            current = queue.pop(0)
+            for successor in self.graph.successors(current):
+                if successor not in visited:
+                    visited.add(successor)
+                    downstream.append(successor)
+                    queue.append(successor)
+
+        return downstream
+
+    def _remove_produced_evidence(self, node_id: str) -> None:
+        """从因果图中移除由指定节点（或其执行步骤）产生的证据节点。"""
+        if not self.op_id:
+            return
+
+        step_ids = {node_id}
+        if self.graph.has_node(node_id) and self.graph.nodes[node_id].get("type") == "subtask":
+            step_ids.update(self._collect_execution_steps(node_id))
+
+        evidence_ids_to_remove: set[str] = set()
+        for ev_id, ev_data in self.causal_graph.nodes(data=True):
+            if ev_data.get("node_type") != "Evidence":
+                continue
+            if ev_data.get("source_step_id") in step_ids:
+                evidence_ids_to_remove.add(ev_id)
+
+        for step_id in step_ids:
+            if not self.causal_graph.has_node(step_id):
+                continue
+            for successor in self.causal_graph.successors(step_id):
+                succ_data = self.causal_graph.nodes[successor]
+                if succ_data.get("node_type") == "Evidence":
+                    evidence_ids_to_remove.add(successor)
+
+        for ev_id in evidence_ids_to_remove:
+            if self.causal_graph.has_node(ev_id):
+                self.causal_graph.remove_node(ev_id)
+                schedule_coroutine(delete_node(self.op_id, ev_id, 'causal'))
+
+    def restart_node(self, node_id: str, cascade: bool = True) -> list[str]:
+        """重启指定节点（及可选的下游节点），重置状态并清理产物。"""
+        if not self.graph.has_node(node_id):
+            raise NodeNotFoundError(f"Node {node_id} not found in task graph")
+
+        reset_nodes: list[str] = [node_id]
+        self._reset_single_node(node_id)
+
+        if cascade:
+            downstream = self._get_downstream_nodes(node_id)
+            for nid in downstream:
+                self._reset_single_node(nid)
+            reset_nodes.extend(downstream)
+
+        return reset_nodes
+
+    def _reset_single_node(self, node_id: str) -> None:
+        """重置单个节点的执行状态并清理相关产物。"""
+        if not self.graph.has_node(node_id):
+            return
+
+        node_data = self.graph.nodes[node_id]
+        node_type = node_data.get("type")
+
+        node_data["status"] = "pending"
+        node_data["restarted_by_user"] = True
+        node_data["completed_at"] = None
+        node_data["updated_at"] = time.time()
+
+        for field in (
+            "observation", "findings", "errors", "evidence_ids",
+            "raw_output", "summary", "reflection", "critical_success_step_id",
+        ):
+            if field in node_data:
+                node_data[field] = [] if field in ("findings", "errors", "evidence_ids") else None
+
+        node_data["artifacts"] = []
+        if "staged_causal_nodes" in node_data:
+            node_data["staged_causal_nodes"] = []
+
+        if node_type == "subtask":
+            step_ids = self._collect_execution_steps(node_id)
+            for step_id in step_ids:
+                if self.graph.has_node(step_id):
+                    self.graph.remove_node(step_id)
+                    if self.op_id:
+                        schedule_coroutine(delete_node(self.op_id, step_id, 'task'))
+
+        self._remove_produced_evidence(node_id)
+        self._invalidate_execution_cache(node_id)
+        self._sync_node(node_id, 'task')
+
+    @classmethod
+    async def load_from_db(cls, session_id: str) -> "GraphManager":
+        """
+        Reconstruct a GraphManager from database state.
+
+        Loads all nodes and edges for both task and causal graphs.
+        Note: executor conversation history and shared findings are not restored.
+        """
+        from sqlalchemy import select
+        from core.database.utils import AsyncSessionLocal, get_session_nodes, get_session_edges
+        from core.database.models import SessionModel
+
+        async with AsyncSessionLocal() as db_session:
+            result = await db_session.execute(
+                select(SessionModel).where(SessionModel.id == session_id)
+            )
+            session_record = result.scalar_one_or_none()
+            if not session_record:
+                raise GraphManagerError(f"Session {session_id} not found in database")
+
+        task_id = session_record.name or session_id
+        goal = session_record.goal or ""
+
+        # Create instance without triggering DB writes
+        gm = cls(task_id, goal, op_id=session_id, _skip_db_init=True)
+
+        # Rebuild task graph
+        task_nodes = await get_session_nodes(session_id, 'task')
+        for node in task_nodes:
+            gm.graph.add_node(node.node_id, **(node.data or {}))
+        task_edges = await get_session_edges(session_id, 'task')
+        for edge in task_edges:
+            gm.graph.add_edge(edge.source_node_id, edge.target_node_id, **(edge.data or {}))
+
+        # Rebuild causal graph
+        causal_nodes = await get_session_nodes(session_id, 'causal')
+        for node in causal_nodes:
+            gm.causal_graph.add_node(node.node_id, **(node.data or {}))
+        causal_edges = await get_session_edges(session_id, 'causal')
+        for edge in causal_edges:
+            gm.causal_graph.add_edge(edge.source_node_id, edge.target_node_id, **(edge.data or {}))
+
+        # Restore counters from loaded graph state
+        max_sequence = 0
+        for node in task_nodes:
+            data = node.data or {}
+            if data.get("type") == "execution_step":
+                max_sequence = max(max_sequence, data.get("sequence", 0))
+        gm._execution_counter = max_sequence
+        gm._causal_graph_version = len(causal_nodes)
+
+        return gm

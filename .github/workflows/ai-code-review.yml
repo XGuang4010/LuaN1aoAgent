@@ -1,0 +1,99 @@
+name: AI Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  ai-review:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get PR diff
+        id: diff
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr_diff.txt
+          # Truncate if too large (LLM token limit)
+          if [ $(wc -c < pr_diff.txt) -gt 30000 ]; then
+            head -c 30000 pr_diff.txt > pr_diff_truncated.txt
+            echo "DIFF_FILE=pr_diff_truncated.txt" >> $GITHUB_ENV
+            echo "truncated=true" >> $GITHUB_OUTPUT
+          else
+            echo "DIFF_FILE=pr_diff.txt" >> $GITHUB_ENV
+            echo "truncated=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: AI Code Review
+        id: review
+        env:
+          # 推荐使用 DeepSeek（免费额度高）或 通义千问
+          # DeepSeek: https://platform.deepseek.com/ （免费 5000万 tokens）
+          # 通义千问: https://dashscope.aliyun.com/ （免费额度）
+          # Gemini: https://aistudio.google.com/ （免费层）
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_API_BASE: ${{ secrets.LLM_API_BASE || 'https://api.deepseek.com/v1' }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL || 'deepseek-chat' }}
+        run: |
+          DIFF_CONTENT=$(cat $DIFF_FILE | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')
+          
+          SYSTEM_PROMPT='你是一位资深代码审查专家。请审查以下代码变更，关注：
+1. 安全漏洞（注入、越权、敏感信息泄露等）
+2. 代码质量（可读性、性能、错误处理）
+3. 架构设计（是否符合项目规范）
+4. 潜在 Bug
+
+请以中文输出，格式如下：
+- ✅ 通过的方面
+- ⚠️ 需要改进的地方（附具体代码位置和建议）
+- ❌ 严重问题（必须修复）
+
+如果改动很小或无明显问题，可简要回复"代码改动合理，未发现明显问题"。'
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "model": "${LLM_MODEL}",
+            "messages": [
+              {"role": "system", "content": "${SYSTEM_PROMPT}"},
+              {"role": "user", "content": "请审查以下代码变更（Git diff 格式）：\n\n${DIFF_CONTENT}"}
+            ],
+            "temperature": 0.3
+          }
+EOF
+          )
+
+          RESPONSE=$(curl -s -X POST "${LLM_API_BASE}/chat/completions" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${LLM_API_KEY}" \
+            -d "$PAYLOAD")
+
+          REVIEW_CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // "AI 审查接口返回异常，请检查配置"')
+          
+          if [ "${{ steps.diff.outputs.truncated }}" = "true" ]; then
+            REVIEW_CONTENT="⚠️ 改动较大，仅审查了前 30KB 的内容。\n\n${REVIEW_CONTENT}"
+          fi
+          
+          echo "REVIEW<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW_CONTENT" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Post review comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const review = `${{ steps.review.outputs.REVIEW }}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🤖 AI Code Review\n\n${review}\n\n---\n*Powered by ${process.env.LLM_MODEL || 'DeepSeek'}*`  
+            });

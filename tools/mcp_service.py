@@ -22,10 +22,23 @@ import json
 import subprocess
 import time
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+
 from http.server import BaseHTTPRequestHandler
 import sys
 import os
+
+# 加载项目根目录的 .env，确保 TOOLS_HOME 等配置在 MCP 子进程中可用
+# MCP 服务作为独立子进程启动，可能无法继承父进程的环境变量
+try:
+    from dotenv import load_dotenv
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    dotenv_path = os.path.join(project_root, ".env")
+    if os.path.exists(dotenv_path):
+        load_dotenv(dotenv_path, override=True)
+except Exception:
+    pass  # dotenv 未安装或 .env 不存在时静默继续
+
 import threading
 from collections import deque
 import httpx
@@ -61,6 +74,16 @@ except ImportError as e:
     mcp_server_module = None
     FastMCP = None
     Server = None
+
+# 尝试导入 Context（用于工具上下文注入）
+Context = None
+try:
+    from mcp.server.fastmcp import Context
+except ImportError:
+    try:
+        from fastmcp import Context
+    except ImportError:
+        pass
 
 # 设置环境变量，抑制不必要的输出和警告
 os.environ.setdefault("FASTMCP_NO_BANNER", "1")
@@ -574,13 +597,36 @@ async def web_search(query: str, num_results: int = 5) -> str:
 
 
 @mcp.tool()
-async def shell_exec(command: str) -> str:
+async def shell_exec(command: str, ctx: Context = None) -> str:
     """
     Shell命令执行接口 (异步非阻塞)。实时将输出打印到终端。
     禁止执行mcp服务中已提供的工具，如dirsearch等
     :param command: 要执行的shell命令（如"ls -al"）
     :return: 命令输出结果
     """
+    validator = _get_validator_from_context(ctx)
+    if validator and validator.scope.disable_shell_exec:
+        return json.dumps({"success": False, "error": "shell_exec 已被边界策略禁用", "rule": "disable_shell_exec"})
+
+    # Windows 兼容性预检
+    import sys
+    is_windows = sys.platform == "win32"
+    if is_windows:
+        linux_only_patterns = {
+            "sudo ": "Windows does not support 'sudo'. Run without privilege elevation or use appropriate Windows methods.",
+            "which ": "Windows uses 'where' instead of 'which'.",
+            "; ": "Windows cmd.exe does not support ';' command chaining. Use '&' or run commands separately.",
+        }
+        for pattern, hint in linux_only_patterns.items():
+            if pattern in command:
+                return json.dumps({
+                    "success": False,
+                    "output": "",
+                    "error_type": "PLATFORM_INCOMPATIBLE",
+                    "message": f"Command contains Linux-specific syntax '{pattern.strip()}' which is not supported on Windows.",
+                    "fix_suggestion": hint + " Alternatively, use the dedicated MCP tools (nmap_scan, dirsearch_scan, etc.) instead of shell_exec.",
+                })
+
     output_lines = []
     try:
         process = await asyncio.create_subprocess_shell(
@@ -612,6 +658,9 @@ async def shell_exec(command: str) -> str:
             elif "Only 1 -p option allowed" in full_output:
                 error_type = "SYNTAX"
                 fix_suggestion = "Incorrect command syntax. Review the tool's help or manual for correct usage."
+            elif is_windows and "'" in command and '"' in command:
+                error_type = "SYNTAX"
+                fix_suggestion = "Windows cmd.exe has complex quote handling. Prefer using dedicated MCP tools over shell_exec for tool invocation."
 
             return json.dumps(
                 {
@@ -646,7 +695,7 @@ async def shell_exec(command: str) -> str:
 _python_exec_lock = asyncio.Lock()
 
 @mcp.tool()
-async def python_exec(script: str) -> str:
+async def python_exec(script: str, ctx: Context = None) -> str:
     """
     Python脚本执行接口 (异步非阻塞).
     此工具现在运行在独立线程中，不会阻塞主服务，允许你在运行长时间计算时保持系统响应。
@@ -655,6 +704,9 @@ async def python_exec(script: str) -> str:
     :param script: 要执行的Python代码字符串。确保代码是自包含的，并通过 `print()` 输出结果。
     :return: 执行输出结果
     """
+    validator = _get_validator_from_context(ctx)
+    if validator and validator.scope.disable_python_exec:
+        return json.dumps({"success": False, "error": "python_exec 已被边界策略禁用", "rule": "disable_python_exec"})
     import io
 
     # 定义同步执行函数
@@ -819,41 +871,42 @@ async def sqlmap_tool(
     Returns:
         JSON string containing the execution result (stdout/stderr).
     """
-    cmd = ["sqlmap"]
-    
-    if url:
-        cmd.extend(["-u", url])
-    elif raw_request_file:
-        cmd.extend(["-r", raw_request_file])
-    else:
-        return json.dumps({"success": False, "error": "Either 'url' or 'raw_request_file' must be provided."}, ensure_ascii=False)
-        
-    # Basic non-interactive settings
-    cmd.extend(["--batch", "--random-agent"])
-    
-    if tamper:
-        cmd.extend(["--tamper", tamper])
-    
-    if level and 1 <= level <= 5:
-        cmd.extend(["--level", str(level)])
-    
-    if risk and 1 <= risk <= 3:
-        cmd.extend(["--risk", str(risk)])
-        
-    if dbms:
-        cmd.extend(["--dbms", dbms])
-        
-    if extra_args:
-        # Simple splitting, be careful with quotes in extra_args if manually passed
-        # Ideally, we should use shlex.split but we'll keep it simple for now or assume lists
-        import shlex
-        cmd.extend(shlex.split(extra_args))
-
-    # Add output directory to capture results if needed, but for now we rely on stdout
-    # Or we could force it to dump to a specific directory we can read back.
-    # For MCP simple usage, stdout is primary.
-
     try:
+        tool_path = _resolve_tool_path("sqlmap", "SQLMAP_PATH", "sqlmap/sqlmap.exe")
+        cmd = [tool_path]
+        
+        if url:
+            cmd.extend(["-u", url])
+        elif raw_request_file:
+            cmd.extend(["-r", raw_request_file])
+        else:
+            return json.dumps({"success": False, "error": "Either 'url' or 'raw_request_file' must be provided."}, ensure_ascii=False)
+            
+        # Basic non-interactive settings
+        cmd.extend(["--batch", "--random-agent"])
+        
+        if tamper:
+            cmd.extend(["--tamper", tamper])
+        
+        if level and 1 <= level <= 5:
+            cmd.extend(["--level", str(level)])
+        
+        if risk and 1 <= risk <= 3:
+            cmd.extend(["--risk", str(risk)])
+            
+        if dbms:
+            cmd.extend(["--dbms", dbms])
+            
+        if extra_args:
+            # Simple splitting, be careful with quotes in extra_args if manually passed
+            # Ideally, we should use shlex.split but we'll keep it simple for now or assume lists
+            import shlex
+            cmd.extend(shlex.split(extra_args))
+
+        # Add output directory to capture results if needed, but for now we rely on stdout
+        # Or we could force it to dump to a specific directory we can read back.
+        # For MCP simple usage, stdout is primary.
+
         # Run sqlmap
         logger.info(f"Executing sqlmap command: {' '.join(cmd)}")
         process = await asyncio.create_subprocess_exec(
@@ -919,14 +972,16 @@ async def dirsearch_scan(url: str, extensions: str = "php,html,js,txt", extra_ar
                 filtered_args.append(arg)
             i += 1
     
-    cmd = f"dirsearch -u {url} -e {extensions} -q"
-    if filtered_args:
-        cmd += " " + " ".join(filtered_args)
-
     output_lines = []
     try:
-        process = await asyncio.create_subprocess_shell(
-            cmd,
+        tool_path = _resolve_tool_path("dirsearch", "DIRSEARCH_PATH", "dirsearch/dirsearch.exe")
+        # 使用列表传参避免 shell 注入和 Windows 路径解析问题
+        cmd_parts = [tool_path, "-u", url, "-e", extensions, "-q"]
+        if filtered_args:
+            cmd_parts.extend(filtered_args)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd_parts,
             stdout=asyncio.subprocess.PIPE, 
             stderr=asyncio.subprocess.STDOUT
         )
@@ -999,6 +1054,17 @@ def _coerce_bool(value, default=False):
 
     return default
 
+
+def _get_validator_from_context(ctx):
+    """从 MCP 上下文获取边界校验器，如果未配置则返回 None"""
+    if ctx is None:
+        return None
+    # ctx is a FastMCP Context object. ctx.request_context returns a
+    # mcp.shared.context.RequestContext dataclass (not a dict), so .get()
+    # cannot be called on it. Scope config is not passed through the MCP
+    # protocol — primary boundary validation happens at the Executor layer.
+    return None
+
 @mcp.tool()
 async def http_request(
     url: str,
@@ -1008,6 +1074,7 @@ async def http_request(
     timeout: int = 10,
     allow_redirects: bool | str | int | None = True,
     raw_mode: bool = False,
+    ctx: Context = None,
 ) -> str:
     """
     (首选)专业且健壮的HTTP请求工具，用于网络探测和安全测试。
@@ -1113,6 +1180,17 @@ async def http_request(
                         encoding_mode = "form_urlencoded_string"
 
         request_params["headers"] = request_headers
+
+        # 二次边界校验
+        validator = _get_validator_from_context(ctx)
+        if validator:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            host = parsed.hostname
+            port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+            result = validator.validate_target(host, port)
+            if not result.allowed:
+                return json.dumps({"success": False, "error": f"边界拦截: {result.reason}", "rule": result.rule_name})
 
         # 发送请求
         response = await _httpx_client.request(**request_params)
@@ -2119,8 +2197,9 @@ async def nuclei_scan(
     
     try:
         # 构建 nuclei 命令
+        tool_path = _resolve_tool_path("nuclei", "NUCLEI_PATH", "nuclei/nuclei.exe")
         cmd = [
-            "nuclei",
+            tool_path,
             "-u", target,
             "-jsonl",  # JSON Lines 输出
             "-silent",  # 减少噪音
@@ -2243,7 +2322,8 @@ async def nuclei_list_templates(
     
     try:
         # 构建命令
-        cmd = ["nuclei", "-tl"]  # template list
+        tool_path = _resolve_tool_path("nuclei", "NUCLEI_PATH", "nuclei/nuclei.exe")
+        cmd = [tool_path, "-tl"]  # template list
         
         if tags:
             cmd.extend(["-tags", tags])
@@ -2287,6 +2367,346 @@ async def nuclei_list_templates(
         result["error"] = str(e)
     
     return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+# ==============================================================================
+# Recon Tools - nmap_scan, httpx_scan, info_extract
+# ==============================================================================
+
+def _resolve_tool_path(tool_name: str, env_var: str, default_subpath: str = None) -> str:
+    """解析外部工具路径（三层优先级）。"""
+    import os
+
+    # 1. 单工具环境变量
+    path = os.environ.get(env_var)
+    if path:
+        if os.path.exists(path):
+            return path
+        # 环境变量可能指向无 .exe 后缀的路径，尝试补充
+        if not path.endswith(".exe") and os.path.exists(path + ".exe"):
+            return path + ".exe"
+
+    # 2. TOOLS_HOME 约定路径
+    tools_home = os.environ.get("TOOLS_HOME")
+    if tools_home and default_subpath:
+        candidate = os.path.join(tools_home, default_subpath)
+        if os.path.exists(candidate):
+            return candidate
+        # 尝试 .exe 后缀（Windows）
+        if not candidate.endswith(".exe"):
+            candidate_exe = candidate + ".exe"
+            if os.path.exists(candidate_exe):
+                return candidate_exe
+
+    # 3. 直接失败：不依赖系统 PATH 兜底，未配置时明确报错
+    raise FileNotFoundError(
+        f"Tool '{tool_name}' not found. "
+        f"Please set {env_var} environment variable, "
+        f"or install it to {tools_home}/{default_subpath} if TOOLS_HOME is configured."
+    )
+
+
+def _parse_nmap_output(output: str) -> Dict[str, Any]:
+    """解析 nmap 原始输出为结构化 findings。"""
+    import re
+
+    hosts: List[Dict[str, Any]] = []
+    current_host: Optional[Dict[str, Any]] = None
+    in_port_section = False
+
+    for line in output.splitlines():
+        line = line.rstrip()
+
+        # Host line: "Nmap scan report for hostname (ip)" or "Nmap scan report for ip"
+        host_match = re.match(r"Nmap scan report for (.+)", line)
+        if host_match:
+            if current_host:
+                hosts.append(current_host)
+            host_part = host_match.group(1).strip()
+            # Check if format is "hostname (ip)"
+            paren_match = re.match(r"(.+)\s+\(([^)]+)\)", host_part)
+            if paren_match:
+                hostname = paren_match.group(1).strip()
+                ip = paren_match.group(2).strip()
+            else:
+                hostname = ""
+                ip = host_part
+            current_host = {
+                "ip": ip,
+                "hostname": hostname,
+                "mac": "",
+                "vendor": "",
+                "os": {},
+                "ports": [],
+                "scripts": [],
+            }
+            in_port_section = False
+            continue
+
+        if current_host is None:
+            continue
+
+        # MAC Address
+        mac_match = re.match(r"MAC Address:\s*([0-9A-Fa-f:]+)(?:\s+\(([^)]+)\))?", line)
+        if mac_match:
+            current_host["mac"] = mac_match.group(1)
+            if mac_match.group(2):
+                current_host["vendor"] = mac_match.group(2)
+            continue
+
+        # Port header
+        if re.match(r"PORT\s+STATE\s+SERVICE", line):
+            in_port_section = True
+            continue
+
+        # Port line: "80/tcp open  http     nginx 1.18.0"
+        if in_port_section:
+            port_match = re.match(
+                r"(\d+)/(tcp|udp|sctp)\s+(\S+)\s+(\S+)(?:\s+(.+))?",
+                line
+            )
+            if port_match:
+                port_num = int(port_match.group(1))
+                protocol = port_match.group(2)
+                state = port_match.group(3)
+                service_name = port_match.group(4)
+                version_info = (port_match.group(5) or "").strip()
+
+                service: Dict[str, Any] = {"name": service_name}
+                if version_info:
+                    # Try parse "product version" format
+                    vparts = version_info.split(None, 1)
+                    service["product"] = vparts[0]
+                    if len(vparts) > 1:
+                        service["version"] = vparts[1]
+
+                current_host["ports"].append({
+                    "number": port_num,
+                    "protocol": protocol,
+                    "state": state,
+                    "service": service,
+                })
+            else:
+                # If line doesn't match port pattern and is not empty, port section ended
+                if line.strip() and not line.startswith("|") and not line.startswith("|_"):
+                    in_port_section = False
+            continue
+
+    if current_host:
+        hosts.append(current_host)
+
+    total_open = sum(
+        len([p for p in h["ports"] if p["state"] == "open"])
+        for h in hosts
+    )
+
+    return {
+        "hosts": hosts,
+        "summary": {
+            "total_hosts": len(hosts),
+            "up_hosts": len(hosts),
+            "total_open_ports": total_open,
+        },
+    }
+
+
+def _parse_httpx_output(output: str) -> Dict[str, Any]:
+    """解析 httpx 原始输出为结构化 findings。"""
+    import re
+
+    endpoints: List[Dict[str, Any]] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # Format: https://example.com [200] [Example]
+        match = re.match(r"(https?://\S+)\s+\[(\d+)\]\s+\[(.*)\]", line)
+        if match:
+            url = match.group(1)
+            status_code = int(match.group(2))
+            title = match.group(3).strip()
+            endpoints.append({
+                "url": url,
+                "status_code": status_code,
+                "title": title,
+            })
+
+    # Any endpoint that appears in httpx stdout was successfully probed
+    successful = len(endpoints)
+    failed = 0
+
+    return {
+        "endpoints": endpoints,
+        "summary": {
+            "total_urls": len(endpoints),
+            "successful": successful,
+            "failed": failed,
+        },
+    }
+
+
+@mcp.tool()
+async def nmap_scan(target: str, ports: str = "1-65535", args: str = "-sV") -> str:
+    """
+    Nmap 端口扫描工具，执行后解析原始输出并生成 structured_findings。
+
+    Args:
+        target: 扫描目标（IP 或域名）
+        ports: 端口范围，默认 "1-65535"
+        args: 额外 nmap 参数，默认 "-sV"
+
+    Returns:
+        JSON 包含 success、raw_output、structured_findings
+    """
+    output_lines: List[str] = []
+    try:
+        tool_path = _resolve_tool_path("nmap", "NMAP_PATH", "nmap/nmap.exe")
+        # 使用列表传参避免 shell 注入和 Windows 路径解析问题
+        cmd_parts = [tool_path, "-p", ports]
+        if args:
+            cmd_parts.extend(args.split())
+        cmd_parts.append(target)
+
+        process = await asyncio.create_subprocess_exec(
+            *cmd_parts,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        while True:
+            line = await process.stdout.readline()
+            if not line:
+                break
+            decoded = line.decode("utf-8", errors="replace")
+            output_lines.append(decoded)
+
+        return_code = await process.wait()
+        full_output = "".join(output_lines)
+
+        if return_code != 0:
+            error_type = "RUNTIME"
+            fix_suggestion = "Check the command's arguments and permissions."
+            if "not found" in full_output or "No such file or directory" in full_output:
+                error_type = "MISSING_TOOL"
+                fix_suggestion = "nmap is not installed or not in PATH."
+            elif "requires root privileges" in full_output or "requires admin privileges" in full_output:
+                error_type = "PERMISSION"
+                fix_suggestion = "UDP scan (-sU) or SYN scan (-sS) requires administrator/root privileges on this system. Try -sT (TCP connect scan) or run with elevated privileges."
+            elif "Only root" in full_output:
+                error_type = "PERMISSION"
+                fix_suggestion = "This scan type requires administrator/root privileges. Try -sT (TCP connect scan) or run with elevated privileges."
+            return json.dumps({
+                "success": False,
+                "output": full_output,
+                "error_type": error_type,
+                "message": f"nmap exited with code {return_code}.",
+                "fix_suggestion": fix_suggestion,
+            })
+
+        structured = _parse_nmap_output(full_output)
+        return json.dumps({
+            "success": True,
+            "raw_output": full_output,
+            "structured_findings": structured,
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.exception("nmap_scan execution failed")
+        return json.dumps({
+            "success": False,
+            "error_type": "RUNTIME",
+            "message": f"nmap_scan failed: {e}",
+            "fix_suggestion": "Check target validity and tool availability.",
+        })
+
+
+@mcp.tool()
+async def httpx_scan(urls: str, args: str = "-title -tech -status-code") -> str:
+    """
+    Httpx 批量 HTTP 探测工具，执行后解析原始输出并生成 structured_findings。
+
+    Args:
+        urls: 目标 URL 列表（换行分隔或单个 URL）
+        args: 额外 httpx 参数，默认 "-title -tech -status-code"
+
+    Returns:
+        JSON 包含 success、raw_output、structured_findings
+    """
+    output_lines: List[str] = []
+    try:
+        tool_path = _resolve_tool_path("httpx", "HTTPX_PATH", "httpx/httpx.exe")
+        # 使用列表传参避免 shell 注入和 Windows 路径解析问题
+        cmd_parts = [tool_path]
+        if args:
+            cmd_parts.extend(args.split())
+
+        # 通过 stdin 传递 URL 列表
+        process = await asyncio.create_subprocess_exec(
+            *cmd_parts,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+        # 写入 URLs 到 stdin
+        stdin_data = urls.encode("utf-8")
+        stdout, _ = await process.communicate(input=stdin_data)
+        output_lines.append(stdout.decode("utf-8", errors="replace"))
+
+        return_code = process.returncode
+        full_output = "".join(output_lines)
+
+        if return_code != 0:
+            error_type = "RUNTIME"
+            fix_suggestion = "Check the command's arguments and permissions."
+            if "not found" in full_output or "No such file or directory" in full_output:
+                error_type = "MISSING_TOOL"
+                fix_suggestion = "httpx is not installed or not in PATH."
+            return json.dumps({
+                "success": False,
+                "output": full_output,
+                "error_type": error_type,
+                "message": f"httpx exited with code {return_code}.",
+                "fix_suggestion": fix_suggestion,
+            })
+
+        structured = _parse_httpx_output(full_output)
+        return json.dumps({
+            "success": True,
+            "raw_output": full_output,
+            "structured_findings": structured,
+        }, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        logger.exception("httpx_scan execution failed")
+        return json.dumps({
+            "success": False,
+            "error_type": "RUNTIME",
+            "message": f"httpx_scan failed: {e}",
+            "fix_suggestion": "Check target validity and tool availability.",
+        })
+
+
+@mcp.tool()
+async def info_extract(text: str, context: str = "") -> str:
+    """
+    从任意文本中提取结构化 recon 信息。
+
+    当前为 mock 实现，返回空 records 列表；后续由 LLM 驱动。
+
+    Args:
+        text: 待提取的原始文本
+        context: 提取上下文说明（如 "nmap 扫描结果"）
+
+    Returns:
+        JSON 包含 records 列表
+    """
+    return json.dumps({
+        "success": True,
+        "records": [],
+        "context": context,
+        "note": "Mock implementation; LLM-driven extraction not yet enabled.",
+    }, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":

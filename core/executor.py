@@ -12,6 +12,11 @@ import httpx
 from rich.errors import MarkupError
 from rich.panel import Panel
 
+
+class BoundaryBlockedError(Exception):
+    """Raised when a tool call is blocked by boundary validation."""
+    pass
+
 from core.console import sanitize_for_rich
 
 
@@ -24,6 +29,9 @@ from core.graph_manager import GraphManager
 from core.prompts import PromptManager
 from llm.llm_client import LLMClient
 from tools.mcp_client import call_mcp_tool_async
+from core.boundary import BoundaryValidator, BoundaryCheckResult
+from core.data_contracts import StructuredObservation, ToolError
+from core.parsers import parse_tool_output
 from conf.config import (
     EXECUTOR_MAX_STEPS,
     EXECUTOR_MESSAGE_COMPRESS_THRESHOLD,
@@ -36,6 +44,7 @@ from conf.config import (
     EXECUTOR_COMPRESS_INTERVAL_MSG_THRESHOLD,
     EXECUTOR_TOOL_TIMEOUT,
     EXECUTOR_MAX_OUTPUT_LENGTH,
+    EXECUTOR_DB_OUTPUT_LENGTH,
     TOOL_TIMEOUTS,
 )
 
@@ -431,6 +440,13 @@ async def _build_executor_prompt(
         main_goal=main_goal, subtask=subtask, context=context, global_mission_briefing=global_mission_briefing
     )
 
+    # TestPolicy injection: append policy_context to system prompt if present
+    extra_data = subtask_data.get("extra_data") or {}
+    policy_context = extra_data.get("policy_context")
+    if policy_context:
+        policy_section = f"\n【测试约束】\n{json.dumps(policy_context, ensure_ascii=False)}\n"
+        system_prompt += policy_section
+
     if not messages or messages[0]["role"] != "system":
         messages.insert(0, {"role": "system", "content": system_prompt})
     else:
@@ -497,6 +513,7 @@ async def run_executor_cycle(
     output_mode: str = "default",
     max_steps: int = None,
     disable_artifact_check: bool = False,
+    validator: BoundaryValidator = None,
 ) -> tuple[str, str, dict]:
     """
     执行器循环：为子任务执行思想树探索循环。
@@ -711,6 +728,7 @@ async def run_executor_cycle(
         potential_parent = last_step_ids[0] if last_step_ids else subtask_id
         current_cycle_step_ids = []
 
+        # BoundaryBlockedError defined as module-level; reuse to avoid redefining each cycle
         for i, op in enumerate(current_step_ops):
             step_id = op.get("node_id")
             if not step_id or step_id == "None":
@@ -766,6 +784,26 @@ async def run_executor_cycle(
                 )
             )
             
+            if validator:
+                boundary_result = validator.validate_tool_call(tool_name, tool_params)
+                if not boundary_result.allowed:
+                    error_msg = f"边界拦截: {boundary_result.reason} (规则: {boundary_result.rule_name})"
+                    _get_console().print(Panel(error_msg, title="边界拦截", style="bold red"))
+
+                    async def _blocked(msg):
+                        raise BoundaryBlockedError(msg)
+
+                    execution_tasks.append(_blocked(error_msg))
+                    try:
+                        await broker.emit(
+                            "boundary.blocked",
+                            {"tool": tool_name, "reason": boundary_result.reason, "rule": boundary_result.rule_name, "params": tool_params},
+                            op_id=os.path.basename(log_dir) if log_dir else None,
+                        )
+                    except Exception:
+                        pass
+                    continue
+
             execution_tasks.append(
                 asyncio.wait_for(
                     _handle_local_tool(tool_name, tool_params, graph_manager)
@@ -814,7 +852,10 @@ async def run_executor_cycle(
                 step_status = "completed"
                 
                 # Handle errors
-                if isinstance(result, Exception):
+                if isinstance(result, BoundaryBlockedError):
+                    result_str = str(result)
+                    step_status = "failed"
+                elif isinstance(result, Exception):
                     result_str = f"Error executing tool: {result}"
                     step_status = "failed"
                     if console_output_path:
@@ -825,45 +866,140 @@ async def run_executor_cycle(
                             pass
                 else:
                     result_str = str(result)
-                    # Check for soft errors in JSON response
+                    # Check for soft errors in JSON response using ToolError
+                    tool_error = None
                     try:
                         data = json.loads(result_str)
-                        if isinstance(data, dict) and data.get("success") is False:
-                            error_type = data.get("error_type")
-                            if error_type in ["SYNTAX", "MISSING_TOOL"]:
+                        if isinstance(data, dict):
+                            tool_error = ToolError.from_json_response(data)
+                            if tool_error is not None:
                                 has_correctable_error = True
-                                feedback = f"- Step {step_id} (Tool: {tool_name}) failed: {data.get('message')} -> {data.get('fix_suggestion')}"
+                                feedback = f"- Step {step_id} (Tool: {tool_name}) failed: {tool_error.message} -> {tool_error.fix_suggestion}"
                                 correction_feedback.append(feedback)
                                 step_status = "failed"
                     except:
                         pass
 
-                # Truncation logic
+                # Determine StructuredObservation status
+                if step_status == "failed":
+                    structured_status = "failed"
+                else:
+                    structured_status = "success"
+
+                # Build errors list
+                errors_list: list[ToolError] = []
+                if isinstance(result, BoundaryBlockedError):
+                    errors_list.append(ToolError(
+                        error_type="BOUNDARY",
+                        message=str(result),
+                        fix_suggestion="",
+                        is_correctable=False,
+                    ))
+                elif isinstance(result, Exception):
+                    errors_list.append(ToolError(
+                        error_type="RUNTIME",
+                        message=f"Error executing tool: {result}",
+                        fix_suggestion="",
+                        is_correctable=False,
+                    ))
+                elif tool_error is not None:
+                    errors_list.append(tool_error)
+
+                # Dual-buffer truncation (LLM buffer + DB buffer)
                 original_length = len(result_str)
+                llm_result = result_str
+                db_result = result_str
                 was_truncated = False
+                truncation_info = None
                 if original_length > MAX_OBSERVATION_LENGTH:
-                    result_str = result_str[:MAX_OBSERVATION_LENGTH] + f"\n... (Truncated from {original_length})"
+                    llm_result = result_str[:MAX_OBSERVATION_LENGTH]
                     was_truncated = True
+                    truncation_info = f"Truncated from {original_length}"
                     _get_console().print(Panel(f"⚠️ 动作 {step_id} 结果过长已截断", title="警告", style="yellow"))
                     truncated_steps.append({
-                        "step_id": step_id, 
-                        "tool_name": tool_name, 
+                        "step_id": step_id,
+                        "tool_name": tool_name,
                         "original_length": original_length,
-                        "sent_length": MAX_OBSERVATION_LENGTH
+                        "sent_length": MAX_OBSERVATION_LENGTH,
                     })
 
-                observations.append(f"动作 {step_id} (工具={tool_name}) 的结果: {result_str}")
-                
-                # Update graph and logs
+                if original_length > EXECUTOR_DB_OUTPUT_LENGTH:
+                    db_result = result_str[:EXECUTOR_DB_OUTPUT_LENGTH]
+
+                # P2: Parse structured findings from tool output (use full result, not truncated)
+                tool_findings = parse_tool_output(tool_name, result_str)
+                finding_categories = sorted(set(f.category for f in tool_findings))
+
+                # Build LLM-friendly summary with structured finding info
+                if tool_findings:
+                    summary = f"Tool {tool_name} — {len(tool_findings)} findings ({', '.join(finding_categories)})"
+                else:
+                    first_line = llm_result.strip().split('\n')[0][:100] if llm_result.strip() else "(empty result)"
+                    summary = f"Tool {tool_name} — {first_line}"
+                summary = summary[:300]
+
+                # Build StructuredObservation
+                structured_obs = StructuredObservation(
+                    step_id=step_id,
+                    tool=tool_name,
+                    status=structured_status,
+                    summary=summary,
+                    raw_output=db_result,
+                    findings=tool_findings,
+                    errors=errors_list,
+                    evidence_ids=[],
+                    truncated=was_truncated,
+                    truncation_info=truncation_info,
+                )
+
+                # Auto-write evidence to causal graph for high-confidence findings
+                for finding in structured_obs.findings:
+                    if finding.confidence >= 0.3:
+                        evidence_id = graph_manager.add_evidence(
+                            evidence_id=f"ev_{step_id}_{finding.key}",
+                            category=finding.category,
+                            content=finding.value,
+                            source_step=step_id,
+                            confidence=finding.confidence,
+                        )
+                        structured_obs.evidence_ids.append(evidence_id)
+
+                observations.append(structured_obs)
+
+                # Update graph and logs with structured data
                 graph_manager.update_node(
                     step_id,
                     {
-                        "observation": observations[-1],
+                        "observation": structured_obs.to_dict(),
                         "observation_truncated": was_truncated,
                         "observation_original_length": original_length,
                         "status": step_status,
                     },
                 )
+
+                # ReconStore integration: auto-extract info from tool output
+                if step_status == "completed" and result_str:
+                    try:
+                        from core.recon_extractor import ReconExtractor
+                        extractor = ReconExtractor()
+                        # Reconstruct tool_params from current_step_ops[i] to avoid stale scope variable
+                        current_op_action = current_step_ops[i].get("action") or {}
+                        if isinstance(current_op_action, str):
+                            try:
+                                current_op_action = json.loads(current_op_action)
+                            except Exception:
+                                current_op_action = {}
+                        current_tool_params = current_op_action.get("params") or current_op_action.get("arguments") or {}
+                        await extractor.extract_from_tool_result(
+                            task_id=graph_manager.task_id,
+                            step_id=step_id,
+                            tool_name=tool_name,
+                            tool_params=current_tool_params if isinstance(current_tool_params, dict) else {},
+                            result_str=result_str,
+                        )
+                    except Exception:
+                        # Silent fail: recon extraction should not block main flow
+                        pass
 
                 # P1-1: 假设跨步持久化 — 将 formulate_hypotheses 输出写入子任务节点
                 if tool_name == "formulate_hypotheses" and step_status == "completed":
@@ -898,13 +1034,15 @@ async def run_executor_cycle(
                 messages.append({"role": "user", "content": correction_prompt})
                 continue
 
-            full_observation = "\n".join(observations)
-            messages.append({"role": "user", "content": f"你并行执行了 {len(last_step_ids)} 个动作，观察到：\n{full_observation}"})
+            formatted = f"你并行执行了 {len(last_step_ids)} 个动作：\n"
+            for obs in observations:
+                formatted += "  " + obs.format_for_llm() + "\n"
+            messages.append({"role": "user", "content": formatted})
 
             if output_mode == "debug": # Changed from if verbose:
                 _get_console().print(
                     Panel(
-                        f"工具执行结果:\n{full_observation}",
+                        f"工具执行结果:\n{formatted}",
                         title="[bold green]Debug Tool Results[/bold green]", # Changed title
                         style="green"
                     )

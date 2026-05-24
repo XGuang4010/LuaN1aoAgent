@@ -1,0 +1,52 @@
+[Unit]
+Description=LuaN1ao Agent - Autonomous Penetration Testing Agent
+After=network.target
+
+[Service]
+Type=simple
+# 请根据实际环境修改 WorkingDirectory 和 ExecStart
+WorkingDirectory=/opt/LuaN1aoAgent
+ExecStart=/usr/bin/python3 agent.py --goal "%i" --task-name "%n"
+
+# 标准输出和错误重定向到 journal，便于查看
+StandardOutput=journal
+StandardError=journal
+
+# 进程退出策略
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 安全限制（建议在生产环境启用）
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+
+# ================================================================
+# 安装说明 (Installation Instructions)
+# ================================================================
+# 1. 复制本文件到 systemd 目录：
+#    sudo cp scripts/luan1ao-agent.service /etc/systemd/system/
+#
+# 2. 重新加载 systemd 配置：
+#    sudo systemctl daemon-reload
+#
+# 3. 启动服务（将目标 URL 作为实例参数传入）：
+#    sudo systemctl start luan1ao-agent@"测试 http://example.com".service
+#
+# 4. 设置开机自启：
+#    sudo systemctl enable luan1ao-agent@"测试 http://example.com".service
+#
+# 5. 查看服务状态和日志：
+#    sudo systemctl status luan1ao-agent@"测试 http://example.com".service
+#    sudo journalctl -u luan1ao-agent@"测试 http://example.com".service -f
+#
+# 注意：
+# - %i 会被 systemd 实例化参数替换为目标字符串
+# - %n 会被替换为完整单元名称（含实例参数），用作 task-name
+# - 如果目标字符串包含特殊字符，建议通过环境变量或配置文件传递
+# ================================================================
