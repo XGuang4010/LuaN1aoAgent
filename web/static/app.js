@@ -3212,6 +3212,9 @@ function resetScopeForm() {
   document.getElementById('scope-disable-shell').checked = false;
   document.getElementById('scope-disable-python').checked = false;
   document.getElementById('scope-block-private').checked = false;
+  document.getElementById('scope-block-udp-full').checked = false;
+  document.getElementById('scope-block-tcp-full').checked = false;
+  document.getElementById('scope-block-udp-syn').checked = false;
 }
 
 // 切换 Scope 配置展开/折叠
@@ -3313,6 +3316,13 @@ function updateHitlLabel() {
 
 // 提交创建任务
 async function submitCreateTask() {
+  // 防重复提交
+  if (state.creatingTask) {
+    console.log('Task creation already in progress, ignoring duplicate click');
+    return;
+  }
+  state.creatingTask = true;
+
   const goal = document.getElementById('create-goal').value.trim();
   const taskName = document.getElementById('create-taskname').value.trim();
   const hitl = document.getElementById('create-hitl').checked;
@@ -3324,6 +3334,7 @@ async function submitCreateTask() {
   if (!goal) {
     alert(currentLang === 'zh' ? '请输入任务目标' : 'Please enter a task goal');
     document.getElementById('create-goal').focus();
+    state.creatingTask = false;
     return;
   }
 
@@ -3379,9 +3390,13 @@ async function submitCreateTask() {
         ? `任务已启动！${hitl ? '（人机协同模式）' : ''}`
         : `Task started!${hitl ? ' (HITL mode)' : ''}`;
       console.log(msg, r);
+    } else {
+      alert(currentLang === 'zh' ? `创建任务失败: ${r.error || '未知错误'}` : `Failed to create task: ${r.error || 'Unknown error'}`);
     }
   } catch (e) {
     alert(currentLang === 'zh' ? `创建任务失败: ${e}` : `Failed to create task: ${e}`);
+  } finally {
+    state.creatingTask = false;
   }
 }
 
