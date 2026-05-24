@@ -982,11 +982,19 @@ async def run_executor_cycle(
                     try:
                         from core.recon_extractor import ReconExtractor
                         extractor = ReconExtractor()
+                        # Reconstruct tool_params from current_step_ops[i] to avoid stale scope variable
+                        current_op_action = current_step_ops[i].get("action") or {}
+                        if isinstance(current_op_action, str):
+                            try:
+                                current_op_action = json.loads(current_op_action)
+                            except Exception:
+                                current_op_action = {}
+                        current_tool_params = current_op_action.get("params") or current_op_action.get("arguments") or {}
                         await extractor.extract_from_tool_result(
                             task_id=graph_manager.task_id,
                             step_id=step_id,
                             tool_name=tool_name,
-                            tool_params=action if isinstance(action, dict) else {},
+                            tool_params=current_tool_params if isinstance(current_tool_params, dict) else {},
                             result_str=result_str,
                         )
                     except Exception:

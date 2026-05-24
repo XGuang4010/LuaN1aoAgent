@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional, Dict, Any
-from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, ForeignKey, Boolean, JSON, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.sql import func
 
@@ -178,6 +178,10 @@ class ReconRecord(Base):
     source_step_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     confidence: Mapped[Optional[float]] = mapped_column(nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        Index("idx_recon_task_type_target", "task_id", "record_type", "target"),
+    )
 
 
 class TaskPolicy(Base):

@@ -44,10 +44,16 @@ class TestPolicy:
         This is a lightweight mock implementation for unit-testability.
         Production usage should call an LLM to perform the parsing.
         """
+        import warnings
+        warnings.warn(
+            "TestPolicy.parse_policy() is a mock implementation; use LLM-based parsing for production.",
+            UserWarning,
+            stacklevel=2,
+        )
         result: Dict[str, Any] = {}
         lower = raw_text.lower()
 
-        if "sleep" in raw_text or "sql" in lower or "注入" in raw_text:
+        if "sleep" in lower or "sql" in lower or "注入" in raw_text:
             result["sql_injection"] = {"allowed_verification": ["sleep"]}
         if "ssrf" in lower or "callback" in lower or "服务器请求伪造" in raw_text:
             result["ssrf"] = {"callback_url": "https://cb.net"}
@@ -71,8 +77,14 @@ class TestPolicy:
         return self.parsed.get(vuln_type)
 
     def check_hard_denylist(self, command: str) -> bool:
-        """Return False if *command* matches a hard-denied pattern, else True."""
+        """Return False if *command* matches a hard-denied pattern, else True.
+
+        Uses prefix boundary matching to reduce false positives from
+        string literals while still catching actual commands.
+        """
+        import re
         for pattern in HARD_DENYLIST:
-            if pattern in command:
+            escaped = re.escape(pattern)
+            if re.search(r'(?:^|\s|[^a-zA-Z0-9_])' + escaped, command):
                 return False
         return True

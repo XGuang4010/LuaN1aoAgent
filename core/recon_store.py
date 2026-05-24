@@ -54,7 +54,7 @@ class ReconStore:
                 existing_core = self._extract_core_id(record_type, record.value)
                 if existing_core == core_id:
                     # Deduplicate: keep max confidence, latest source_step_id
-                    record.confidence = max(record.confidence or 0.0, confidence)
+                    record.confidence = max(record.confidence if record.confidence is not None else 0.0, confidence)
                     record.source_step_id = source_step_id
                     await session.commit()
                     return
